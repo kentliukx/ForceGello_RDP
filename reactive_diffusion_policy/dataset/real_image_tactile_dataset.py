@@ -37,6 +37,12 @@ class RealImageTactileDataset(BaseImageDataset):
                  transform_params=None,
                  ):
         assert os.path.isdir(dataset_path)
+        self.action_key = shape_meta['action'].get('key', 'action')
+        self.action_space = shape_meta['action'].get('space', 'cartesian')
+        if self.action_space not in ('cartesian', 'joint'):
+            raise ValueError(f"unsupported action space: {self.action_space}")
+        if self.action_space == 'joint' and (delta_action or relative_action):
+            raise ValueError("joint pos/vel targets must use delta_action=False and relative_action=False")
 
         rgb_keys = list()
         lowdim_keys = list()
@@ -59,14 +65,14 @@ class RealImageTactileDataset(BaseImageDataset):
                 extended_lowdim_keys.append(key)
 
         zarr_path = os.path.join(dataset_path, 'replay_buffer.zarr')
-        zarr_load_keys = set(rgb_keys + lowdim_keys + extended_rgb_keys + extended_lowdim_keys + ['action'])
+        zarr_load_keys = set(rgb_keys + lowdim_keys + extended_rgb_keys + extended_lowdim_keys + [self.action_key])
         zarr_load_keys = list(filter(lambda key: "wrt" not in key, zarr_load_keys))
         replay_buffer = ReplayBuffer.copy_from_path(
             zarr_path, keys=zarr_load_keys)
 
         if delta_action:
             # replace action as relative to previous frame
-            actions = replay_buffer['action'][:]
+            actions = replay_buffer[self.action_key][:]
             # support positions only at this time
             assert actions.shape[1] <= 3
             actions_diff = np.zeros_like(actions)
@@ -80,7 +86,7 @@ class RealImageTactileDataset(BaseImageDataset):
                 # it should be scheduled at the previous timestep for the current timestep
                 # to ensure consistency with positional mode
                 actions_diff[start+1:end] = np.diff(actions[start:end], axis=0)
-            replay_buffer['action'][:] = actions_diff
+            replay_buffer[self.action_key][:] = actions_diff
         
         self.relative_action = relative_action
         self.relative_tcp_obs_for_relative_action = relative_tcp_obs_for_relative_action
@@ -165,9 +171,12 @@ class RealImageTactileDataset(BaseImageDataset):
         if self.relative_action:
             action_all = relative_data_dict['action']
         else:
-            action_all = self.replay_buffer['action'][:, :self.shape_meta['action']['shape'][0]]
+            action_all = self.replay_buffer[self.action_key][:, :self.shape_meta['action']['shape'][0]]
 
-        normalizer['action'] = get_action_normalizer(action_all)
+        if self.action_space == 'joint':
+            normalizer['action'] = SingleFieldLinearNormalizer.create_fit(action_all)
+        else:
+            normalizer['action'] = get_action_normalizer(action_all)
 
         # obs
         for key in list(set(self.lowdim_keys)):
@@ -202,7 +211,7 @@ class RealImageTactileDataset(BaseImageDataset):
         return normalizer
 
     def get_all_actions(self) -> torch.Tensor:
-        return torch.from_numpy(self.replay_buffer['action'][:, :self.shape_meta['action']['shape'][0]])
+        return torch.from_numpy(self.replay_buffer[self.action_key][:, :self.shape_meta['action']['shape'][0]])
 
     def __len__(self):
         return len(self.sampler)
@@ -252,7 +261,7 @@ class RealImageTactileDataset(BaseImageDataset):
                 extended_obs_dict[key] = data[key][:, :self.shape_meta['extended_obs'][key]['shape'][0]].astype(np.float32)
                 del data[key]
 
-        action = data['action'][:, :self.shape_meta['action']['shape'][0]].astype(np.float32)
+        action = data[self.action_key][:, :self.shape_meta['action']['shape'][0]].astype(np.float32)
         # handle latency by dropping first n_latency_steps action
         # observations are already taken care of by T_slice
         if self.n_latency_steps > 0:

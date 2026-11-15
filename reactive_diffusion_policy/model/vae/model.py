@@ -188,10 +188,8 @@ class VAE:
             self.optim_params += list(self.post_quant.parameters())
 
         if load_dir is not None:
-            try:
-                state_dict = torch.load(load_dir)
-            except RuntimeError:
-                state_dict = torch.load(load_dir, map_location=torch.device("cpu"))
+            # Local workspace checkpoints include Hydra config objects, not just tensors.
+            state_dict = torch.load(load_dir, map_location="cpu", weights_only=False)
             self.load_state_dict(state_dict)
 
         if self.use_vq:

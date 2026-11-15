@@ -183,6 +183,11 @@ After postprocessing, you may see the following structure:
 You can also use your own data collection system to collect data and convert it to the same `zarr` format as ours.
 
 ## 📚 Training
+
+For the symmetric ForceGello dataset and right-arm joint-action training (Jacobian-estimated wrench), see
+[双臂统一 Zarr 与右臂两阶段训练](docs/forcegello_right.md).
+`train_rdp.sh` now defaults to these right-arm configurations.
+
 1. **Task Configuration.**
    In addition to the task config file used in [data collection](#data-collection),
    another file is needed to configure dataset, runner, and model-related parameters such as `obs` and `action`.

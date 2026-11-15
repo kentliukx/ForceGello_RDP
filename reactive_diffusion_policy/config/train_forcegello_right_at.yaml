@@ -1,0 +1,11 @@
+defaults:
+  - train_at_workspace
+  - override task: real_forcegello_right_wrench_at_60fps
+  - override at: at_forcegello_right
+  - _self_
+
+policy:
+  device: ${training.device}
+
+logging:
+  mode: offline
