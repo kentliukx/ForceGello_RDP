@@ -1,10 +1,10 @@
 defaults:
   - train_latent_diffusion_unet_real_image_workspace
-  - override task: real_forcegello_right_wrench_ldp_60fps
+  - override task: real_forcegello_right_wrench_ldp_20fps
   - override at: at_forcegello_right
   - _self_
 
-obs_temporal_downsample_ratio: 3
+obs_temporal_downsample_ratio: 4
 policy:
   at:
     device: ${training.device}

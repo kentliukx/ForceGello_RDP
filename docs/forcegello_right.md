@@ -44,7 +44,11 @@ uv run --extra collection --with 'zarr>=2.16,<3' --with 'numcodecs<0.16' \
 `joint1..joint6` 与 `grasp_site` 的模型，避免导入 i2rt。
 
 默认以每条轨迹开始时间为原点建立 60 Hz 时间轴，观测只取不晚于当前时刻的最新状态和图像。
-20 Hz 图像可对应多个机器人样本，不插值出新图像。
+原始 20 Hz 图像可对应多个机器人样本，不插值出新图像；训练时再按 5 Hz 取样并保持。
+现有 60 Hz Zarr 可以直接复用：训练加载时按每段每 3 帧选一帧得到 20 Hz 本体时间轴，
+再在该时间轴上每 4 帧选一张图像得到 5 Hz 视觉，并模拟图像保持。源 Zarr 不会被修改。
+训练动作从 `target` 重新构造为下一个选中时刻（50 ms 后）的主臂命令，
+不会直接抽取仍指向 16.7 ms 后的旧 `action`；每段没有有效下一选中帧的末尾被丢弃。
 机器人/图像最大年龄默认为 0.05/0.10 秒，缺失和过期处拆段，训练窗口不会跨越缺口。
 
 ## Jacobian 末端力估计
@@ -113,12 +117,36 @@ TCP 位姿和速度表达在各自机械臂的基座系。`tcp_vel` 为 `[vx,vy,
 
 ```yaml
 obs:
-  external_img:          {shape: [3, 240, 320], type: rgb}
-  right_wrist_img:       {shape: [3, 240, 320], type: rgb}
+  external_img:
+    shape: [3, 240, 320]
+    type: rgb
+    n_obs_steps: 2
+    temporal_downsample_ratio: 4
+    hold_steps: 4
+  right_wrist_img:
+    shape: [3, 240, 320]
+    type: rgb
+    n_obs_steps: 2
+    temporal_downsample_ratio: 4
+    hold_steps: 4
+  right_robot_joint_pos:
+    shape: [7]
+    type: low_dim
+    n_obs_steps: 2
+    temporal_downsample_ratio: 1
+  right_robot_joint_vel:
+    shape: [7]
+    type: low_dim
+    n_obs_steps: 2
+    temporal_downsample_ratio: 1
+  right_robot_tcp_wrench:
+    shape: [6]
+    type: low_dim
+    n_obs_steps: 2
+    temporal_downsample_ratio: 1
+extended_obs:
   right_robot_joint_pos: {shape: [7], type: low_dim}
   right_robot_joint_vel: {shape: [7], type: low_dim}
-  right_robot_tcp_wrench: {shape: [6], type: low_dim}
-extended_obs:
   right_robot_tcp_wrench: {shape: [6], type: low_dim}
 action:
   key: right_robot_action
@@ -130,12 +158,19 @@ action:
 训练左臂时将 obs 中的右臂字段换成左臂，并选择 `left_robot_action`；双臂训练同时选择两侧 obs，并选择全局 `action`、维度 28。
 关节命令按每维范围归一化，不使用 TCP 的相对位姿变换；`relative_action=False`。
 
-- AT 编码器输入 `(B,32,14)`，快 GRU 使用 `(B,32,6)` wrench，重建 14 维动作序列。
-- 慢策略输入两帧视觉/关节状态历史，低维状态每帧为 `7+7+6=20` 维。
-- 视觉历史间隔 1/20 秒，动作和快解码器反馈间隔 1/60 秒。
-- 当前卷积 AT 将 32 个动作编码成长度 8、每项 16 维的 latent。
-- 解码完整输出 `(B,32,14)`，返回可执行部分为 `(B,27,14)`。
+- 训练与部署均为：动作、关节位置、速度和 wrench **20 Hz**；视觉和慢扩散推理 **5 Hz**。
+- 慢策略每次取两帧视觉，间隔 4 个机器人周期（0.2 秒）；本体状态取当前与上一周期，间隔 50 ms。
+- 图像在每段轨迹的 5 Hz 时钟上取样保持，不使用未来帧。
+- 快 GRU 每个 20 Hz 控制周期接收位置7、速度7、wrench6，合计 **20 维**反馈。
+- Chunk 恢复 **32 步**（20 Hz，1.6 秒的序列）；原 RDP 公式使用 8 步观测前缀，返回 25 步可执行动作。
+- AT 编码器输入 `(B,32,14)`，GRU 训练条件 `(B,32,20)`，完整解码 `(B,32,14)`，可执行部分 `(B,25,14)`。
+- 卷积 AT 将 32 个动作编码成长度 8、每项 16 维的 latent。
+- 默认 task 为 `real_forcegello_right_wrench_at_20fps` / `real_forcegello_right_wrench_ldp_20fps`；
+  原 `_60fps` 配置名作为兼容别名指向这两份新配置。
 
+需要重新训练 AT 和 LDP；旧 60 Hz checkpoint 的时间定义与网络序列长度不适用于当前部署默认值。
+源 Zarr 中 `action[t] = 主臂[t+1]` 的 `t` 仍为 60 Hz；训练样本的 `t` 则为抽帧后的 20 Hz，
+`action[t] = 主臂[t+1]` 对应 50 ms 后。观测与主臂动作均按选中的实测帧取值，不插值，速度保留 rad/s。
 在 RDP 训练环境中：
 
 ```bash
@@ -145,7 +180,8 @@ DATASET_PATH=data/forcegello_zarr bash train_rdp.sh
 
 脚本先用 `train_forcegello_right_at` 训练 AT，再将 checkpoint 传给 `train_forcegello_right_rdp`。
 默认 `GPU_ID=0`、`LOGGING_MODE=offline`，结果位于 `data/outputs/forcegello_right_时间/{at,rdp}`。
-训练配置不包含 YAM 在线执行接口；部署时应把反归一化后的前七维、后七维分别交给从臂 pos/vel 控制接口。
+YAM 的无 ROS 在线执行入口为 [i2rt/examples/rdp_policy/run.py](../../i2rt/examples/rdp_policy/README.md)，
+直接把反归一化后的前七维、后七维交给从臂 pos/vel 控制接口；慢扩散与实时 GRU 解码分开运行。
 
 原 RDP 的 `initial_marker`、`marker_offset` 是 GelSight/McTac 触觉胶面标记点的位置和位移，
 `marker_offset_emb` 是其 PCA 特征；此数据中不包含这些触觉字段或伪造的夹爪力。
