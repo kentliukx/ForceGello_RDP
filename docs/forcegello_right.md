@@ -187,6 +187,9 @@ DATASET_PATH=../i2rt/data/forcegello_zarr bash train_rdp.sh
 
 脚本先用 `train_forcegello_right_at` 训练 AT，再将 checkpoint 传给 `train_forcegello_right_rdp`。
 默认 `GPU_ID=0`、`LOGGING_MODE=offline`，结果位于 `data/outputs/forcegello_right_时间/{at,rdp}`。
+AT 和 RDP 每隔 20 个 epoch 保留一个 `epoch=...-val_loss=...-deploy.ckpt`，其中 AT 只保存
+`model`，RDP 只保存部署使用的 `ema_model`；这些文件不能用来续训。
+各阶段的 `checkpoints/latest.ckpt` 仍保存完整训练状态，可用于断点恢复。
 YAM 的无 ROS 在线执行入口为 [i2rt/examples/rdp_policy/run.py](../../i2rt/examples/rdp_policy/README.md)，
 反归一化后的七维作为位置目标；部署端以相邻目标位置差分生成前六个关节的速度目标，夹爪速度为 0。
 
