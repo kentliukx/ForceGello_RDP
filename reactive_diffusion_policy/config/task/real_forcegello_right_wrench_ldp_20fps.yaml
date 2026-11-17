@@ -28,6 +28,11 @@ shape_meta:
       type: low_dim
       n_obs_steps: 2
       temporal_downsample_ratio: 1
+    right_robot_tcp_pose:
+      shape: [9]
+      type: low_dim
+      n_obs_steps: 2
+      temporal_downsample_ratio: 1
     right_robot_tcp_wrench:
       shape: [6]
       type: low_dim
@@ -40,13 +45,16 @@ shape_meta:
     right_robot_joint_vel:
       shape: [7]
       type: low_dim
+    right_robot_tcp_pose:
+      shape: [9]
+      type: low_dim
     right_robot_tcp_wrench:
       shape: [6]
       type: low_dim
   action:
-    key: right_robot_command
-    space: joint
-    shape: [14]
+    key: right_robot_tcp_delta
+    space: tcp_delta
+    shape: [7]
 
 dataset:
   _target_: reactive_diffusion_policy.dataset.real_image_tactile_latent_diffusion_dataset.RealImageTactileLatentDiffusionDataset
