@@ -268,7 +268,10 @@ class TrainATWorkspace(BaseWorkspace):
                     topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
 
                     if topk_ckpt_path is not None:
-                        self.save_checkpoint(path=topk_ckpt_path)
+                        if cfg.checkpoint.get('deploy_only_topk', False):
+                            self.save_deploy_checkpoint(path=topk_ckpt_path, model_key='model')
+                        else:
+                            self.save_checkpoint(path=topk_ckpt_path)
                 # ========= eval end for this epoch ==========
                 policy.train()
 

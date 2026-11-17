@@ -364,7 +364,11 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                     topk_ckpt_path = topk_manager.get_ckpt_path(metric_dict)
 
                     if topk_ckpt_path is not None:
-                        self.save_checkpoint(path=topk_ckpt_path)
+                        if cfg.checkpoint.get('deploy_only_topk', False):
+                            model_key = 'ema_model' if cfg.training.use_ema else 'model'
+                            self.save_deploy_checkpoint(path=topk_ckpt_path, model_key=model_key)
+                        else:
+                            self.save_checkpoint(path=topk_ckpt_path)
 
                     # recover the DDP model
                     self.model = model_ddp
