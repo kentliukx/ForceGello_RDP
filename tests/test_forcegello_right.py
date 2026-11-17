@@ -13,9 +13,10 @@ from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+I2RT_CHECKOUT = Path(__file__).resolve().parents[2] / "i2rt"
+sys.path.insert(0, str(I2RT_CHECKOUT))
 
-from post_process_forcegello import (
+from examples.bimanual_data_collection.post_process_forcegello import (
     CAMERAS,
     I2RT_ROOT,
     ArmKinematics,
@@ -23,7 +24,7 @@ from post_process_forcegello import (
     load_model,
     read_robot_stream,
 )
-from post_process_forcegello import (
+from examples.bimanual_data_collection.post_process_forcegello import (
     main as convert,
 )
 
@@ -124,16 +125,17 @@ def converted(tmp_path: Path, robot_xml: Path) -> Path:
     return output
 
 
-def test_conversion_is_symmetric_and_labels_next_leader_not_follower(
+def test_conversion_aligns_each_leader_command_with_the_current_observation(
     converted: Path,
 ) -> None:
     root = zarr.open_group(str(converted / "replay_buffer.zarr"), mode="r")
     data = root["data"]
-    np.testing.assert_array_equal(root["meta/episode_ends"], [59, 118])
-    assert data["action"].shape == (118, 28)
-    assert data["right_robot_tcp_pose"].shape == (118, 9)
-    assert data["right_robot_tcp_wrench"].shape == (118, 6)
-    assert data["right_robot_jacobian"].shape == (118, 6, 6)
+    assert root.attrs["schema"] == "forcegello.bimanual_joint.v1"
+    np.testing.assert_array_equal(root["meta/episode_ends"], [60, 120])
+    assert data["command"].shape == (120, 28)
+    assert data["right_robot_tcp_pose"].shape == (120, 9)
+    assert data["right_robot_tcp_wrench"].shape == (120, 6)
+    assert data["right_robot_jacobian"].shape == (120, 6, 6)
     assert not any("marker" in key for key in data)
     left_keys = {key.removeprefix("left_") for key in data if key.startswith("left_")}
     right_keys = {
@@ -145,33 +147,35 @@ def test_conversion_is_symmetric_and_labels_next_leader_not_follower(
     assert "right_robot_gripper_force" not in data
     for name in CAMERAS:
         image = data[f"{name}_img"]
-        assert image.shape == (118, 240, 320, 3) and image.dtype == np.uint8
+        assert image.shape == (120, 240, 320, 3) and image.dtype == np.uint8
         assert image[0, 0, 0, 0] > 250 and image[0, 0, 0, 2] < 5
-    for number, start, end in ((1, 0, 59), (2, 59, 118)):
+    for number, start, end in ((1, 0, 60), (2, 60, 120)):
         for side in ("left", "right"):
             raw = read_robot_stream(
                 converted.parent / "raw" / str(number) / f"robot_{side}.pkl"
             )
-            expected = np.stack([leader_target(row) for row in raw[1:]])
+            expected = np.stack([leader_target(row) for row in raw])
             np.testing.assert_allclose(
-                data[f"{side}_robot_action"][start:end], expected
+                data[f"{side}_robot_command"][start:end], expected
             )
             np.testing.assert_allclose(
-                data[f"{side}_robot_target"][start:end],
-                np.stack([leader_target(row) for row in raw[:-1]]),
+                data[f"{side}_leader_joint_pos"][start:end], expected[:, :7]
             )
-            assert data[f"{side}_robot_action"].shape == (118, 14)
-            np.testing.assert_allclose(data[f"{side}_robot_action"][start:end, -1], 0)
-    np.testing.assert_allclose(data["action"][:, :14], data["left_robot_action"][:])
-    np.testing.assert_allclose(data["action"][:, 14:], data["right_robot_action"][:])
-    assert not np.allclose(data["action"][58], data["target"][59])
-    assert data["action_monotonic_ns"].shape == (118,)
+            np.testing.assert_array_equal(
+                data["robot_source_monotonic_ns"][start:end, 0 if side == "left" else 1],
+                [row["monotonic_ns"] for row in raw],
+            )
+            assert data[f"{side}_robot_command"].shape == (120, 14)
+            np.testing.assert_allclose(data[f"{side}_robot_command"][start:end, -1], 0)
+    np.testing.assert_allclose(data["command"][:, :14], data["left_robot_command"][:])
+    np.testing.assert_allclose(data["command"][:, 14:], data["right_robot_command"][:])
+    assert "target" not in data and "action_monotonic_ns" not in data
+    assert "action_source_monotonic_ns" not in data
     assert data["timestamp"].dtype == np.float64
     ns = data["monotonic_ns"][:]
     assert np.all(data["robot_source_monotonic_ns"][:] <= ns[:, None])
     assert np.all(data["camera_source_monotonic_ns"][:] <= ns[:, None])
-    assert np.all(data["action_source_monotonic_ns"][:] > ns[:, None])
-    np.testing.assert_allclose(np.diff(data["timestamp"][:59]), 1 / 60, atol=1e-6)
+    np.testing.assert_allclose(np.diff(data["timestamp"][:60]), 1 / 60, atol=1e-6)
     with pytest.raises(FileExistsError):
         convert(converted.parent / "raw", converted)
 
@@ -211,10 +215,7 @@ def test_missing_samples_split_sequences_without_cross_gap_actions(
     for end in ends:
         ns = root["data/monotonic_ns"][start:end]
         np.testing.assert_allclose(np.diff(ns) / 1e9, 1 / 60, atol=1e-8)
-        np.testing.assert_allclose(
-            root["data/action_monotonic_ns"][start:end] - ns, round(1e9 / 60), atol=1
-        )
-        assert np.all(root["data/action_source_monotonic_ns"][start:end] > ns[:, None])
+        assert np.all(root["data/robot_source_monotonic_ns"][start:end] <= ns[:, None])
         start = end
 
 
@@ -226,7 +227,7 @@ def config(name: str, overrides: list[str]):
 
 
 @pytest.mark.parametrize(
-    "key,dim", [("left_robot_action", 14), ("right_robot_action", 14), ("action", 28)]
+    "key,dim", [("left_robot_command", 14), ("right_robot_command", 14), ("command", 28)]
 )
 def test_action_selection_and_joint_normalization(
     converted: Path, key: str, dim: int
@@ -243,9 +244,14 @@ def test_action_selection_and_joint_normalization(
     )
     dataset = hydra.utils.instantiate(cfg.task.dataset)
     assert dataset.action_key == key
+    expected_indices = np.concatenate([
+        np.arange(start + phase + 3, end, 3)
+        for start, end in ((0, 60), (60, 120))
+        for phase in range(3)
+    ])
     expected = zarr.open_group(str(converted / "replay_buffer.zarr"), mode="r")[
-        f"data/{key.removesuffix('action')}target"
-    ][np.concatenate([np.arange(3, 58, 3), np.arange(62, 117, 3)])]
+        f"data/{key}"
+    ].oindex[expected_indices]
     np.testing.assert_allclose(dataset.get_all_actions().numpy(), expected)
     assert dataset[0]["action"].shape == (32, dim)
     normalizer = dataset.get_normalizer()["action"]
@@ -275,10 +281,15 @@ def test_right_arm_dataset_and_both_network_stages(
     assert batch["extended_obs"]["right_robot_joint_pos"].shape == (2, 32, 7)
     assert batch["extended_obs"]["right_robot_joint_vel"].shape == (2, 32, 7)
     assert not any(key.startswith("left") for key in batch["obs"])
-    assert dataset.action_key == "right_robot_action"
+    assert dataset.action_key == "right_robot_command"
+    expected_indices = np.concatenate([
+        np.arange(start + phase + 3, end, 3)
+        for start, end in ((0, 60), (60, 120))
+        for phase in range(3)
+    ])
     expected = zarr.open_group(str(converted / "replay_buffer.zarr"), mode="r")[
-        "data/right_robot_target"
-    ][np.concatenate([np.arange(3, 58, 3), np.arange(62, 117, 3)])]
+        "data/right_robot_command"
+    ].oindex[expected_indices]
     np.testing.assert_allclose(dataset.get_all_actions().numpy(), expected)
     normalizer = dataset.get_normalizer()
     tokenizer = hydra.utils.instantiate(cfg.policy)
@@ -324,7 +335,7 @@ def test_right_arm_dataset_and_both_network_stages(
     assert torch.isfinite(result["action"]).all()
 
 
-@pytest.mark.parametrize("anchor", [10, 11, 12, 13, 29, 30, 31, 32])
+@pytest.mark.parametrize("anchor", [10, 11, 12, 13, 66, 67, 68, 69])
 def test_rgb_5hz_and_proprio_20hz_are_sampled_independently(
     converted: Path, anchor: int
 ) -> None:
@@ -335,7 +346,7 @@ def test_rgb_5hz_and_proprio_20hz_are_sampled_independently(
     root = zarr.open_group(str(converted / "replay_buffer.zarr"), mode="a")
     # Frame IDs reveal the precise source time, including between visual updates.
     for key in ("external_img", "right_wrist_img"):
-        root[f"data/{key}"][:, 0, 0, 0] = np.arange(118, dtype=np.uint8)
+        root[f"data/{key}"][:, 0, 0, 0] = np.arange(120, dtype=np.uint8)
     cfg = config("train_forcegello_right_rdp", [])
     dataset = RealImageTactileDataset(
         shape_meta=cfg.task.shape_meta,
@@ -347,15 +358,15 @@ def test_rgb_5hz_and_proprio_20hz_are_sampled_independently(
         obs_temporal_downsample_ratio=4,
         sample_hz=20,
     )
-    np.testing.assert_array_equal(dataset.replay_buffer.episode_ends, [19, 38])
+    np.testing.assert_array_equal(dataset.replay_buffer.episode_ends, [19, 38, 57, 76, 95, 114])
     index = next(
         i
         for i, (start, _, padding, _) in enumerate(dataset.sampler.indices)
         if start + 7 - padding == anchor
     )
     sample = dataset[index]
-    episode_start = 0 if anchor < 19 else 19
-    raw_start = 0 if anchor < 19 else 59
+    episode_start = 0 if anchor < 57 else 57
+    raw_start = 0 if anchor < 57 else 60
     local = anchor - episode_start
     expected_rgb = raw_start + (np.array([local - 4, local]) // 4 * 4) * 3
     for key in ("external_img", "right_wrist_img"):
@@ -381,12 +392,12 @@ def test_rgb_5hz_and_proprio_20hz_are_sampled_independently(
         )
     np.testing.assert_allclose(
         sample["action"][7],
-        root["data/right_robot_target"][raw_start + (local + 1) * 3],
+        root["data/right_robot_command"][raw_start + (local + 1) * 3],
     )
     assert not np.allclose(
-        sample["action"][7], root["data/right_robot_action"][raw_start + local * 3]
-    )  # The label must be 50 ms ahead, not the old 16.7 ms target.
-    assert root["data/action"].shape == (118, 28)  # Source data is unchanged.
+        sample["action"][7], root["data/right_robot_command"][raw_start + local * 3]
+    )  # The label is 50 ms ahead of the same-time Zarr action.
+    assert root["data/command"].shape == (120, 28)  # Source data is unchanged.
 
 
 def test_resampling_validates_rates_and_preserves_episode_boundaries(
@@ -395,21 +406,96 @@ def test_resampling_validates_rates_and_preserves_episode_boundaries(
     from reactive_diffusion_policy.dataset.forcegello_sampling import load_joint_replay
 
     path = str(converted / "replay_buffer.zarr")
-    keys = ["right_robot_joint_pos", "right_robot_action"]
+    keys = ["right_robot_joint_pos", "right_robot_command"]
     for rate in (0, -20, float("nan"), 24, 120):
         with pytest.raises(ValueError):
-            load_joint_replay(path, keys, "right_robot_action", rate)
-    replay = load_joint_replay(path, keys, "right_robot_action", 60)
+            load_joint_replay(path, keys, "right_robot_command", rate)
+    replay = load_joint_replay(path, keys, "right_robot_command", 60)
     source = zarr.open_group(path, mode="r")
     np.testing.assert_array_equal(replay.episode_ends, [59, 118])
     np.testing.assert_array_equal(
-        replay["right_robot_action"], source["data/right_robot_action"]
+        replay["right_robot_command"][:],
+        source["data/right_robot_command"].oindex[np.r_[1:60, 61:120]],
     )
-    # Too-short segments disappear; one episode's last target never comes from the next.
+    # Too-short segments disappear; future labels never come from the next episode.
     source = zarr.open_group(path, mode="a")
-    source["meta/episode_ends"][:] = [2, 118]
-    replay = load_joint_replay(path, keys, "right_robot_action", 20)
-    np.testing.assert_array_equal(replay.episode_ends, [38])
+    source["meta/episode_ends"][:] = [2, 120]
+    replay = load_joint_replay(path, keys, "right_robot_command", 20)
+    np.testing.assert_array_equal(replay.episode_ends, [39, 77, 115])
     np.testing.assert_array_equal(
-        replay["right_robot_action"][0], source["data/right_robot_target"][5]
+        replay["right_robot_command"][0], source["data/right_robot_command"][5]
     )
+
+
+def test_all_three_20hz_phases_keep_future_targets_and_episode_split(converted: Path) -> None:
+    from reactive_diffusion_policy.dataset.forcegello_sampling import load_joint_replay
+    from reactive_diffusion_policy.dataset.real_image_tactile_dataset import RealImageTactileDataset
+
+    path = str(converted / "replay_buffer.zarr")
+    source = zarr.open_group(path, mode="r")
+    replay = load_joint_replay(path, ["right_robot_joint_pos", "right_robot_command"],
+                               "right_robot_command", 20)
+    np.testing.assert_array_equal(replay.source_episode_ids, [0, 0, 0, 1, 1, 1])
+    np.testing.assert_array_equal(replay.episode_ends, [19, 38, 57, 76, 95, 114])
+    starts = np.r_[0, replay.episode_ends[:-1]]
+    for episode, (start, end) in enumerate(zip(starts, replay.episode_ends)):
+        raw_start = (episode // 3) * 60 + episode % 3
+        source_indices = np.arange(raw_start, raw_start + 3 * (end - start), 3)
+        np.testing.assert_array_equal(
+            replay["right_robot_joint_pos"][start:end],
+            source["data/right_robot_joint_pos"].oindex[source_indices]
+        )
+        np.testing.assert_array_equal(
+            replay["right_robot_command"][start:end],
+            source["data/right_robot_command"].oindex[source_indices + 3]
+        )
+        np.testing.assert_allclose(
+            source["data/monotonic_ns"].oindex[source_indices + 3]
+            - source["data/monotonic_ns"].oindex[source_indices],
+            50_000_000,
+            atol=1,
+        )
+    cfg = config("train_forcegello_right_rdp", [])
+    dataset = RealImageTactileDataset(
+        shape_meta=cfg.task.shape_meta, dataset_path=str(converted),
+        horizon=32, pad_before=7, pad_after=24, n_obs_steps=8,
+        obs_temporal_downsample_ratio=4, sample_hz=20, val_ratio=0.5,
+    )
+    for group in (0, 1):
+        phases = dataset.val_mask[dataset.replay_buffer.source_episode_ids == group]
+        assert len(phases) == 3 and np.all(phases == phases[0])
+    assert dataset.val_mask[0] != dataset.val_mask[3]
+
+
+def test_slow_visual_and_proprio_precede_fast_state_and_command_by_two_ticks(
+    converted: Path,
+) -> None:
+    from reactive_diffusion_policy.dataset.real_image_tactile_dataset import RealImageTactileDataset
+
+    root = zarr.open_group(str(converted / "replay_buffer.zarr"), mode="a")
+    root["data/external_img"][:, 0, 0, 0] = np.arange(120, dtype=np.uint8)
+    cfg = config("train_forcegello_right_rdp", [])
+    dataset = RealImageTactileDataset(
+        shape_meta=cfg.task.shape_meta, dataset_path=str(converted),
+        horizon=32, pad_before=7, pad_after=24, n_obs_steps=8,
+        obs_temporal_downsample_ratio=4, sample_hz=20,
+        slow_obs_latency_steps=1,
+    )
+    # Slow input is at 20 Hz tick 11, fast state at tick 12, command at tick 13.
+    sample_index = next(
+        i for i, (start, _, padding, _) in enumerate(dataset.sampler.indices)
+        if start + 7 - padding == 12
+    )
+    sample = dataset[sample_index]
+    np.testing.assert_allclose(
+        sample["obs"]["right_robot_joint_pos"][-1],
+        root["data/right_robot_joint_pos"][11 * 3],
+    )
+    np.testing.assert_allclose(
+        sample["extended_obs"]["right_robot_joint_pos"][7],
+        root["data/right_robot_joint_pos"][12 * 3],
+    )
+    np.testing.assert_allclose(
+        sample["action"][7], root["data/right_robot_command"][13 * 3]
+    )
+    np.testing.assert_allclose(sample["obs"]["external_img"][-1, 0, 0, 0] * 255, 8 * 3)

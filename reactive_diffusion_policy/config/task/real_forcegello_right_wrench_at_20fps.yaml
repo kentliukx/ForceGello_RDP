@@ -1,5 +1,5 @@
 name: real_forcegello_right_wrench_at_20fps
-dataset_path: data/forcegello_zarr
+dataset_path: ../i2rt/data/forcegello_zarr
 image_shape: [3, 240, 320]
 control_hz: 20.0
 visual_hz: 5.0
@@ -34,7 +34,7 @@ shape_meta:
       shape: [6]
       type: low_dim
   action:
-    key: right_robot_action
+    key: right_robot_command
     space: joint
     shape: [14]
 

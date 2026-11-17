@@ -36,9 +36,14 @@ class RealImageTactileDataset(BaseImageDataset):
                  relative_tcp_obs_for_relative_action=True,
                  transform_params=None,
                  sample_hz=None,
+                 slow_obs_latency_steps=0,
                  ):
         assert os.path.isdir(dataset_path)
         self.action_key = shape_meta['action'].get('key', 'action')
+        self.slow_obs_latency_steps = int(slow_obs_latency_steps)
+        prefix_length = n_obs_steps if n_obs_steps is not None else horizon + n_latency_steps
+        if self.slow_obs_latency_steps != slow_obs_latency_steps or not 0 <= self.slow_obs_latency_steps < prefix_length:
+            raise ValueError('slow_obs_latency_steps must be an integer within the observation prefix')
         self.action_space = shape_meta['action'].get('space', 'cartesian')
         if self.action_space not in ('cartesian', 'joint'):
             raise ValueError(f"unsupported action space: {self.action_space}")
@@ -108,15 +113,22 @@ class RealImageTactileDataset(BaseImageDataset):
         self.key_first_k = key_first_k
 
         self.seed = seed
-        val_mask = get_val_mask(
-            n_episodes=replay_buffer.n_episodes, 
-            val_ratio=val_ratio,
-            seed=seed)
-        train_mask = ~val_mask
-        train_mask = downsample_mask(
-            mask=train_mask, 
-            max_n=max_train_episodes, 
-            seed=seed)
+        source_ids = getattr(replay_buffer, 'source_episode_ids', None)
+        if source_ids is None:
+            val_mask = get_val_mask(
+                n_episodes=replay_buffer.n_episodes, val_ratio=val_ratio, seed=seed)
+            train_mask = downsample_mask(
+                mask=~val_mask, max_n=max_train_episodes, seed=seed)
+        else:
+            # All 20 Hz phases of one recording must stay in the same split.
+            _, group_indices = np.unique(source_ids, return_inverse=True)
+            group_val = get_val_mask(
+                n_episodes=int(group_indices.max()) + 1,
+                val_ratio=val_ratio, seed=seed)
+            group_train = downsample_mask(
+                mask=~group_val, max_n=max_train_episodes, seed=seed)
+            val_mask = group_val[group_indices]
+            train_mask = group_train[group_indices]
 
         sampler = SequenceSampler(
             replay_buffer=replay_buffer, 
@@ -224,7 +236,7 @@ class RealImageTactileDataset(BaseImageDataset):
         return len(self.sampler)
 
     def _observation_indices(self, key: str, sample_index: int, prefix_steps: int) -> np.ndarray:
-        """Per-modality history, ending at the same current robot observation.
+        """Per-modality history for the slow model, before its latent becomes usable.
 
         Optional hold_steps simulates the slow camera's sample-and-hold on the
         episode clock, including image age between visual updates.
@@ -238,6 +250,7 @@ class RealImageTactileDataset(BaseImageDataset):
             indices = np.arange(prefix_steps - 1, -1, -stride)[::-1]
         else:
             indices = prefix_steps - 1 - np.arange(int(count) - 1, -1, -1) * stride
+        indices = indices - self.slow_obs_latency_steps
         if np.any(indices < 0):
             raise ValueError(f"observation history too short for {key}")
         hold = int(meta.get('hold_steps', 1))
@@ -251,8 +264,8 @@ class RealImageTactileDataset(BaseImageDataset):
             absolute = np.clip(buffer_start + indices - sample_start, buffer_start, buffer_end - 1)
             held = episode_start + ((absolute - episode_start) // hold) * hold
             indices = held - buffer_start + sample_start
-            if np.any(indices < 0) or np.any(indices >= prefix_steps):
-                raise ValueError(f"camera hold for {key} falls outside the observed prefix")
+            if np.any(indices >= prefix_steps):
+                raise ValueError(f"camera hold for {key} falls after the observed prefix")
         return indices
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
@@ -271,7 +284,15 @@ class RealImageTactileDataset(BaseImageDataset):
             # T,H,W,C
             # convert uint8 image to float32
             indices = self._observation_indices(key, idx, prefix_steps)
-            obs_dict[key] = np.moveaxis(data[key][indices],-1,1
+            if np.any(indices < 0):
+                # A held 5 Hz frame can precede the 8-step action window after
+                # delaying the slow observation by one 20 Hz cycle.
+                buffer_start, _, sample_start, _ = self.sampler.indices[idx]
+                absolute = buffer_start + indices - sample_start
+                frames = np.stack([self.replay_buffer[key][int(i)] for i in absolute])
+            else:
+                frames = data[key][indices]
+            obs_dict[key] = np.moveaxis(frames,-1,1
                 ).astype(np.float32) / 255.
             # T,C,H,W
             # save ram

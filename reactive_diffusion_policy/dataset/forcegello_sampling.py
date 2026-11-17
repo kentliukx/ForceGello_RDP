@@ -8,6 +8,33 @@ import zarr
 from reactive_diffusion_policy.common.replay_buffer import ReplayBuffer
 
 
+class IndexedArray:
+    """Read a lower-rate phase view from the original Zarr without copying images."""
+
+    def __init__(self, source, indices):
+        self.source = source
+        self.indices = indices
+        self.shape = (len(indices),) + source.shape[1:]
+        self.dtype = source.dtype
+
+    def __getitem__(self, item):
+        if isinstance(item, tuple):
+            rows, *rest = item
+            mapped = self.indices[rows]
+            if np.isscalar(mapped):
+                return self.source[int(mapped)][tuple(rest)]
+            if len(mapped) == 0:
+                return np.empty((0,) + self.shape[1:], dtype=self.dtype)[(slice(None), *rest)]
+            result = self.source.oindex[mapped]
+            return result[(slice(None), *rest)]
+        rows = self.indices[item]
+        if np.isscalar(rows):
+            return self.source[int(rows)]
+        if len(rows) == 0:
+            return np.empty((0,) + self.shape[1:], dtype=self.dtype)
+        return self.source.oindex[rows]
+
+
 def load_joint_replay(zarr_path, keys, action_key, sample_hz):
     source = zarr.open_group(zarr_path, mode="r")
     source_hz = float(source.attrs["sample_hz"])
@@ -19,41 +46,33 @@ def load_joint_replay(zarr_path, keys, action_key, sample_hz):
             "source sample_hz must be an integer multiple of training sample_hz"
         )
     stride = round(ratio)
-    if stride == 1:
-        return ReplayBuffer.copy_from_path(zarr_path, keys=keys)
-
-    target_key = (
-        "target"
-        if action_key == "action"
-        else action_key.removesuffix("action") + "target"
-    )
-    if target_key not in source["data"]:
-        raise ValueError(
-            f"resampling joint actions requires current leader targets: {target_key}"
-        )
-    # Reserve a real future selected frame in each episode; never label across a gap.
-    selected, lengths = [], []
+    # Each source episode supplies one stream per downsampling phase. Keep phases
+    # as separate episodes so no training window crosses a phase boundary.
+    selected, lengths, groups = [], [], []
     start = 0
-    for end in source["meta/episode_ends"][:]:
-        indices = np.arange(start, int(end) - stride, stride, dtype=np.int64)
-        if len(indices):
-            selected.append(indices)
-            lengths.append(len(indices))
+    for group, end in enumerate(source["meta/episode_ends"][:]):
+        for phase in range(stride):
+            indices = np.arange(start + phase, int(end) - stride, stride, dtype=np.int64)
+            if len(indices):
+                selected.append(indices)
+                lengths.append(len(indices))
+                groups.append(group)
         start = int(end)
     if not selected:
         raise ValueError(
-            "no episode contains a valid next-frame target at the training rate"
+            "no episode contains a valid future command at the training rate"
         )
     indices = np.concatenate(selected)
-    data = {
-        key: source["data"][key].oindex[indices] for key in keys if key != action_key
-    }
-    # Striding old action[t] would still predict the next 60 Hz frame (16.7 ms).
-    # Rebuild from leader targets at t + stride, i.e. 50 ms for 60 -> 20 Hz.
-    data[action_key] = source["data"][target_key].oindex[indices + stride]
-    return ReplayBuffer(
+    data = {key: IndexedArray(source["data"][key], indices)
+            for key in keys if key != action_key}
+    # Raw command[t] is concurrent with observation[t]. The training action
+    # label is the command one training step later, never from another episode.
+    data[action_key] = IndexedArray(source["data"][action_key], indices + stride)
+    replay = ReplayBuffer(
         {
             "data": data,
             "meta": {"episode_ends": np.cumsum(lengths, dtype=np.int64)},
         }
     )
+    replay.source_episode_ids = np.asarray(groups, dtype=np.int64)
+    return replay

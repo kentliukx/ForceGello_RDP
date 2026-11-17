@@ -3,12 +3,13 @@ set -euo pipefail
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")"
 
 GPU_ID=${GPU_ID:-0}
-DATASET_PATH=${DATASET_PATH:-data/forcegello_zarr}
+DATASET_PATH=${DATASET_PATH:-../i2rt/data/forcegello_zarr}
+DATASET_PATH=$(realpath -m -- "${DATASET_PATH}")
 LOGGING_MODE=${LOGGING_MODE:-offline}
 RUN_DIR=${RUN_DIR:-"$(pwd)/data/outputs/forcegello_right_$(date +%Y%m%d_%H%M%S)"}
 
 if [[ ! -d "${DATASET_PATH}/replay_buffer.zarr" ]]; then
-    echo "Missing ${DATASET_PATH}/replay_buffer.zarr; run post_process_forcegello.py first." >&2
+    echo "Missing ${DATASET_PATH}/replay_buffer.zarr; run i2rt/examples/bimanual_data_collection/post_process_forcegello.py first." >&2
     exit 1
 fi
 
