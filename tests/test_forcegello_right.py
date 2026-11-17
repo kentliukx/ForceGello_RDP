@@ -244,10 +244,10 @@ def test_action_selection_and_joint_normalization(
     )
     dataset = hydra.utils.instantiate(cfg.task.dataset)
     assert dataset.action_key == key
+    assert cfg.task.dataset.sample_phase == 0
     expected_indices = np.concatenate([
-        np.arange(start + phase + 3, end, 3)
+        np.arange(start + 3, end, 3)
         for start, end in ((0, 60), (60, 120))
-        for phase in range(3)
     ])
     expected = zarr.open_group(str(converted / "replay_buffer.zarr"), mode="r")[
         f"data/{key}"
@@ -283,9 +283,8 @@ def test_right_arm_dataset_and_both_network_stages(
     assert not any(key.startswith("left") for key in batch["obs"])
     assert dataset.action_key == "right_robot_command"
     expected_indices = np.concatenate([
-        np.arange(start + phase + 3, end, 3)
+        np.arange(start + 3, end, 3)
         for start, end in ((0, 60), (60, 120))
-        for phase in range(3)
     ])
     expected = zarr.open_group(str(converted / "replay_buffer.zarr"), mode="r")[
         "data/right_robot_command"
@@ -466,6 +465,43 @@ def test_all_three_20hz_phases_keep_future_targets_and_episode_split(converted: 
         phases = dataset.val_mask[dataset.replay_buffer.source_episode_ids == group]
         assert len(phases) == 3 and np.all(phases == phases[0])
     assert dataset.val_mask[0] != dataset.val_mask[3]
+
+
+def test_both_stages_use_one_20hz_phase_with_future_joint_targets(converted: Path) -> None:
+    from reactive_diffusion_policy.dataset.forcegello_sampling import load_joint_replay
+    from reactive_diffusion_policy.dataset.real_image_tactile_dataset import RealImageTactileDataset
+
+    at_cfg = config("train_forcegello_right_at", [])
+    rdp_cfg = config("train_forcegello_right_rdp", [])
+    assert at_cfg.task.dataset.sample_phase == 0
+    assert rdp_cfg.task.dataset.sample_phase == 0
+
+    path = str(converted / "replay_buffer.zarr")
+    source = zarr.open_group(path, mode="r")["data"]
+    replay = load_joint_replay(
+        path, ["right_robot_joint_pos", "right_robot_command"],
+        "right_robot_command", 20, sample_phase=0,
+    )
+    np.testing.assert_array_equal(replay.source_episode_ids, [0, 1])
+    np.testing.assert_array_equal(replay.episode_ends, [19, 38])
+    expected_obs = np.r_[0:57:3, 60:117:3]
+    np.testing.assert_array_equal(
+        replay["right_robot_joint_pos"][:],
+        source["right_robot_joint_pos"].oindex[expected_obs],
+    )
+    np.testing.assert_array_equal(
+        replay["right_robot_command"][:],
+        source["right_robot_command"].oindex[expected_obs + 3],
+    )
+    dataset = RealImageTactileDataset(
+        shape_meta=rdp_cfg.task.shape_meta, dataset_path=str(converted),
+        horizon=32, pad_before=7, pad_after=24, n_obs_steps=8,
+        obs_temporal_downsample_ratio=4, sample_hz=20, sample_phase=rdp_cfg.task.dataset.sample_phase,
+        val_ratio=0.5,
+    )
+    np.testing.assert_array_equal(dataset.replay_buffer.episode_ends, [19, 38])
+    with pytest.raises(ValueError, match="sample_phase"):
+        load_joint_replay(path, ["right_robot_joint_pos"], "right_robot_command", 20, sample_phase=3)
 
 
 def test_slow_visual_and_proprio_precede_fast_state_and_command_by_two_ticks(

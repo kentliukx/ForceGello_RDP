@@ -36,6 +36,7 @@ class RealImageTactileDataset(BaseImageDataset):
                  relative_tcp_obs_for_relative_action=True,
                  transform_params=None,
                  sample_hz=None,
+                 sample_phase=None,
                  slow_obs_latency_steps=0,
                  ):
         assert os.path.isdir(dataset_path)
@@ -77,8 +78,13 @@ class RealImageTactileDataset(BaseImageDataset):
             if self.action_space != 'joint' or delta_action or relative_action:
                 raise ValueError("sample_hz resampling requires absolute joint actions")
             from reactive_diffusion_policy.dataset.forcegello_sampling import load_joint_replay
-            replay_buffer = load_joint_replay(zarr_path, zarr_load_keys, self.action_key, float(sample_hz))
+            replay_buffer = load_joint_replay(
+                zarr_path, zarr_load_keys, self.action_key, float(sample_hz),
+                sample_phase=sample_phase,
+            )
         else:
+            if sample_phase is not None:
+                raise ValueError("sample_phase requires sample_hz")
             replay_buffer = ReplayBuffer.copy_from_path(
                 zarr_path, keys=zarr_load_keys)
 

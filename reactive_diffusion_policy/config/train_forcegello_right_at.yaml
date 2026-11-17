@@ -4,6 +4,10 @@ defaults:
   - override at: at_forcegello_right
   - _self_
 
+task:
+  dataset:
+    sample_phase: 0  # One 20 Hz stream per 60 Hz recording.
+
 policy:
   device: ${training.device}
 
