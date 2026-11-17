@@ -98,7 +98,7 @@ class TCPDeltaArray:
         return result[(..., *rest)] if rest else result
 
 
-def load_joint_replay(zarr_path, keys, action_key, sample_hz):
+def load_joint_replay(zarr_path, keys, action_key, sample_hz, sample_phase=None):
     source = zarr.open_group(zarr_path, mode="r")
     source_hz = float(source.attrs["sample_hz"])
     if not all(math.isfinite(rate) and rate > 0 for rate in (source_hz, sample_hz)):
@@ -109,6 +109,12 @@ def load_joint_replay(zarr_path, keys, action_key, sample_hz):
             "source sample_hz must be an integer multiple of training sample_hz"
         )
     stride = round(ratio)
+    if sample_phase is not None and (
+        isinstance(sample_phase, bool)
+        or not isinstance(sample_phase, int)
+        or not 0 <= sample_phase < stride
+    ):
+        raise ValueError(f"sample_phase must be an integer in [0, {stride})")
     tcp_action = action_key.endswith("_robot_tcp_delta")
     if tcp_action:
         side = action_key.removesuffix("_robot_tcp_delta")
@@ -120,7 +126,8 @@ def load_joint_replay(zarr_path, keys, action_key, sample_hz):
     selected, lengths, groups = [], [], []
     start = 0
     for group, end in enumerate(source["meta/episode_ends"][:]):
-        for phase in range(stride):
+        phases = range(stride) if sample_phase is None else (sample_phase,)
+        for phase in phases:
             indices = np.arange(start + phase, int(end) - stride, stride, dtype=np.int64)
             if tcp_action and len(indices):
                 # Keep only consecutive valid targets; never train through idle gaps.
