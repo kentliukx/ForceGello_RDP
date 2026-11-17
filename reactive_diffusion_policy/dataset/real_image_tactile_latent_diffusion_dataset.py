@@ -22,7 +22,7 @@ class RealImageTactileLatentDiffusionDataset(RealImageTactileDataset):
         normalizer = super().get_normalizer(**kwargs)
 
         latent_action_all = []
-        if self.action_space == 'joint' and not self.relative_action:
+        if self.action_space in ('joint', 'tcp_delta') and not self.relative_action:
             # The latent statistics need only actions. Reading two camera images
             # for every overlapping window would turn the lazy three-phase view
             # into a very expensive full-dataset image scan.

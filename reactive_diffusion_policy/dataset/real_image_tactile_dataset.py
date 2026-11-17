@@ -45,10 +45,10 @@ class RealImageTactileDataset(BaseImageDataset):
         if self.slow_obs_latency_steps != slow_obs_latency_steps or not 0 <= self.slow_obs_latency_steps < prefix_length:
             raise ValueError('slow_obs_latency_steps must be an integer within the observation prefix')
         self.action_space = shape_meta['action'].get('space', 'cartesian')
-        if self.action_space not in ('cartesian', 'joint'):
+        if self.action_space not in ('cartesian', 'joint', 'tcp_delta'):
             raise ValueError(f"unsupported action space: {self.action_space}")
-        if self.action_space == 'joint' and (delta_action or relative_action):
-            raise ValueError("joint pos/vel targets must use delta_action=False and relative_action=False")
+        if self.action_space in ('joint', 'tcp_delta') and (delta_action or relative_action):
+            raise ValueError("ForceGello joint and TCP delta targets require delta_action=False and relative_action=False")
 
         rgb_keys = list()
         lowdim_keys = list()
@@ -74,8 +74,8 @@ class RealImageTactileDataset(BaseImageDataset):
         zarr_load_keys = set(rgb_keys + lowdim_keys + extended_rgb_keys + extended_lowdim_keys + [self.action_key])
         zarr_load_keys = list(filter(lambda key: "wrt" not in key, zarr_load_keys))
         if sample_hz is not None:
-            if self.action_space != 'joint' or delta_action or relative_action:
-                raise ValueError("sample_hz resampling requires absolute joint actions")
+            if self.action_space not in ('joint', 'tcp_delta') or delta_action or relative_action:
+                raise ValueError("sample_hz resampling requires ForceGello joint or TCP delta actions")
             from reactive_diffusion_policy.dataset.forcegello_sampling import load_joint_replay
             replay_buffer = load_joint_replay(zarr_path, zarr_load_keys, self.action_key, float(sample_hz))
         else:
@@ -192,7 +192,7 @@ class RealImageTactileDataset(BaseImageDataset):
         else:
             action_all = self.replay_buffer[self.action_key][:, :self.shape_meta['action']['shape'][0]]
 
-        if self.action_space == 'joint':
+        if self.action_space in ('joint', 'tcp_delta'):
             normalizer['action'] = SingleFieldLinearNormalizer.create_fit(action_all)
         else:
             normalizer['action'] = get_action_normalizer(action_all)

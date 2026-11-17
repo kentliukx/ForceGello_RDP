@@ -12,6 +12,7 @@ import zarr
 from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 from torch.utils.data import DataLoader
+from scipy.spatial.transform import Rotation
 
 I2RT_CHECKOUT = Path(__file__).resolve().parents[2] / "i2rt"
 sys.path.insert(0, str(I2RT_CHECKOUT))
@@ -74,6 +75,8 @@ def make_episode(root: Path, number: int, xml: Path, gap: bool = False) -> Path:
                 )  # leader deliberately differs from the follower
                 q[-1] = 0.3 + i * 0.001
                 dq = np.arange(6) * 0.03 + i * 0.002 + offset
+                submitted = q.copy()
+                submitted[:6] += 0.01  # The actual follower command differs from the leader state.
                 ns = origin + round(i * 1e9 / 60)
                 pickle.dump(
                     {
@@ -82,7 +85,9 @@ def make_episode(root: Path, number: int, xml: Path, gap: bool = False) -> Path:
                         "follower": obs,
                         "leader": {"joint_pos": q[:6], "joint_vel": dq},
                         "leader_joint_pos_with_gripper": q,
-                        "teleoperation_mode": "idle",
+                        "teleoperation_mode": "following" if side == "right" else "idle",
+                        "command": {"pos": submitted, "vel": dq.tolist() + [0.0]}
+                        if side == "right" else None,
                         "cartesian": {"tcp_wrench_estimate": np.ones(6) * 999},
                     },
                     stream,
@@ -126,13 +131,13 @@ def converted(tmp_path: Path, robot_xml: Path) -> Path:
 
 
 def test_conversion_aligns_each_leader_command_with_the_current_observation(
-    converted: Path,
+    converted: Path, robot_xml: Path,
 ) -> None:
     root = zarr.open_group(str(converted / "replay_buffer.zarr"), mode="r")
     data = root["data"]
-    assert root.attrs["schema"] == "forcegello.bimanual_joint.v1"
+    assert root.attrs["schema"] == "forcegello.bimanual_command.v1"
     np.testing.assert_array_equal(root["meta/episode_ends"], [60, 120])
-    assert data["command"].shape == (120, 28)
+    assert data["command"].shape == (120, 14)
     assert data["right_robot_tcp_pose"].shape == (120, 9)
     assert data["right_robot_tcp_wrench"].shape == (120, 6)
     assert data["right_robot_jacobian"].shape == (120, 6, 6)
@@ -155,9 +160,33 @@ def test_conversion_aligns_each_leader_command_with_the_current_observation(
                 converted.parent / "raw" / str(number) / f"robot_{side}.pkl"
             )
             expected = np.stack([leader_target(row) for row in raw])
-            np.testing.assert_allclose(
-                data[f"{side}_robot_command"][start:end], expected
+            submitted = np.stack([
+                row["command"]["pos"] if row["command"] is not None
+                else row["follower"]["joint_pos"]
+                for row in raw
+            ])
+            np.testing.assert_allclose(data[f"{side}_robot_command"][start:end], submitted)
+            np.testing.assert_array_equal(
+                data[f"{side}_robot_command_valid"][start:end],
+                np.full(60, side == "right", dtype=np.uint8),
             )
+            kinematics = ArmKinematics(robot_xml, 0.01, 1, 0.095, side)
+            np.testing.assert_allclose(
+                data[f"{side}_robot_tcp_command"][start:end],
+                np.stack([kinematics.pose(row[:6]) for row in submitted]),
+                atol=1e-6,
+            )
+            delta = data[f"{side}_robot_tcp_command_delta"][start:end]
+            if side == "left":
+                np.testing.assert_array_equal(delta[:, :6], 0)
+                np.testing.assert_allclose(delta[:, 6], submitted[:, 6])
+            else:
+                np.testing.assert_allclose(
+                    delta[:, :3],
+                    data[f"{side}_robot_tcp_command"][start:end, :3]
+                    - data[f"{side}_robot_tcp_pose"][start:end, :3],
+                    atol=1e-6,
+                )
             np.testing.assert_allclose(
                 data[f"{side}_leader_joint_pos"][start:end], expected[:, :7]
             )
@@ -165,10 +194,9 @@ def test_conversion_aligns_each_leader_command_with_the_current_observation(
                 data["robot_source_monotonic_ns"][start:end, 0 if side == "left" else 1],
                 [row["monotonic_ns"] for row in raw],
             )
-            assert data[f"{side}_robot_command"].shape == (120, 14)
-            np.testing.assert_allclose(data[f"{side}_robot_command"][start:end, -1], 0)
-    np.testing.assert_allclose(data["command"][:, :14], data["left_robot_command"][:])
-    np.testing.assert_allclose(data["command"][:, 14:], data["right_robot_command"][:])
+            assert data[f"{side}_robot_command"].shape == (120, 7)
+    np.testing.assert_allclose(data["command"][:, :7], data["left_robot_command"][:])
+    np.testing.assert_allclose(data["command"][:, 7:], data["right_robot_command"][:])
     assert "target" not in data and "action_monotonic_ns" not in data
     assert "action_source_monotonic_ns" not in data
     assert data["timestamp"].dtype == np.float64
@@ -202,6 +230,20 @@ def test_wrench_reconstructs_effort_and_rotates_to_tcp(robot_xml: Path) -> None:
     assert not np.allclose(third["right_robot_jacobian"], first["right_robot_jacobian"])
 
 
+def test_tcp_delta_rotation_is_base_frame_xyz_fixed_axis_euler() -> None:
+    from reactive_diffusion_policy.dataset.forcegello_sampling import tcp_delta
+
+    observed = np.array([0.2, -0.1, 0.3, 1, 0, 0, 0, 1, 0], dtype=np.float32)
+    turn = np.array([0.3, -0.2, 0.4])
+    rotation = Rotation.from_euler('xyz', turn).as_matrix()
+    target = np.r_[observed[:3] + [0.01, 0.02, -0.03],
+                   rotation[:, :2].T.flatten()].astype(np.float32)
+    result = tcp_delta(observed, target, np.array(0.6))
+    np.testing.assert_allclose(result[:3], [0.01, 0.02, -0.03], atol=1e-7)
+    np.testing.assert_allclose(result[3:6], turn, atol=1e-7)
+    assert result[6] == pytest.approx(0.6)
+
+
 def test_missing_samples_split_sequences_without_cross_gap_actions(
     tmp_path: Path, robot_xml: Path
 ) -> None:
@@ -226,11 +268,8 @@ def config(name: str, overrides: list[str]):
     return cfg
 
 
-@pytest.mark.parametrize(
-    "key,dim", [("left_robot_command", 14), ("right_robot_command", 14), ("command", 28)]
-)
-def test_action_selection_and_joint_normalization(
-    converted: Path, key: str, dim: int
+def test_tcp_delta_action_uses_future_submitted_target_and_current_follower(
+    converted: Path,
 ) -> None:
     cfg = config(
         "train_forcegello_right_at",
@@ -238,24 +277,30 @@ def test_action_selection_and_joint_normalization(
             f"task.dataset_path={converted}",
             "training.device=cpu",
             "task.dataset.val_ratio=0",
-            f"task.shape_meta.action.key={key}",
-            f"task.shape_meta.action.shape=[{dim}]",
         ],
     )
     dataset = hydra.utils.instantiate(cfg.task.dataset)
-    assert dataset.action_key == key
+    assert dataset.action_key == "right_robot_tcp_delta"
     expected_indices = np.concatenate([
         np.arange(start + phase + 3, end, 3)
         for start, end in ((0, 60), (60, 120))
         for phase in range(3)
     ])
-    expected = zarr.open_group(str(converted / "replay_buffer.zarr"), mode="r")[
-        f"data/{key}"
-    ].oindex[expected_indices]
-    np.testing.assert_allclose(dataset.get_all_actions().numpy(), expected)
-    assert dataset[0]["action"].shape == (32, dim)
+    source = zarr.open_group(str(converted / "replay_buffer.zarr"), mode="r")["data"]
+    observed_indices = expected_indices - 3
+    actions = dataset.get_all_actions().numpy()
+    np.testing.assert_allclose(
+        actions[:, :3],
+        source["right_robot_tcp_command"].oindex[expected_indices][:, :3]
+        - source["right_robot_tcp_pose"].oindex[observed_indices][:, :3],
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        actions[:, 6], source["right_robot_command"].oindex[expected_indices][:, 6]
+    )
+    assert dataset[0]["action"].shape == (32, 7)
     normalizer = dataset.get_normalizer()["action"]
-    values = torch.from_numpy(expected)
+    values = torch.from_numpy(actions)
     normalized = normalizer.normalize(values)
     assert torch.isfinite(normalized).all()
     torch.testing.assert_close(normalizer.unnormalize(normalized), values)
@@ -275,22 +320,27 @@ def test_right_arm_dataset_and_both_network_stages(
     )
     dataset = hydra.utils.instantiate(cfg.task.dataset)
     batch = next(iter(DataLoader(dataset, batch_size=2)))
-    assert batch["action"].shape == (2, 32, 14)
+    assert batch["action"].shape == (2, 32, 7)
     assert batch["obs"]["right_robot_joint_pos"].shape == (2, 2, 7)
     assert batch["extended_obs"]["right_robot_tcp_wrench"].shape == (2, 32, 6)
     assert batch["extended_obs"]["right_robot_joint_pos"].shape == (2, 32, 7)
     assert batch["extended_obs"]["right_robot_joint_vel"].shape == (2, 32, 7)
+    assert batch["extended_obs"]["right_robot_tcp_pose"].shape == (2, 32, 9)
     assert not any(key.startswith("left") for key in batch["obs"])
-    assert dataset.action_key == "right_robot_command"
+    assert dataset.action_key == "right_robot_tcp_delta"
     expected_indices = np.concatenate([
         np.arange(start + phase + 3, end, 3)
         for start, end in ((0, 60), (60, 120))
         for phase in range(3)
     ])
-    expected = zarr.open_group(str(converted / "replay_buffer.zarr"), mode="r")[
-        "data/right_robot_command"
-    ].oindex[expected_indices]
-    np.testing.assert_allclose(dataset.get_all_actions().numpy(), expected)
+    source = zarr.open_group(str(converted / "replay_buffer.zarr"), mode="r")["data"]
+    actions = dataset.get_all_actions().numpy()
+    np.testing.assert_allclose(
+        actions[:, :3],
+        source["right_robot_tcp_command"].oindex[expected_indices][:, :3]
+        - source["right_robot_tcp_pose"].oindex[expected_indices - 3][:, :3],
+        atol=1e-6,
+    )
     normalizer = dataset.get_normalizer()
     tokenizer = hydra.utils.instantiate(cfg.policy)
     tokenizer.set_normalizer(normalizer)
@@ -330,8 +380,8 @@ def test_right_arm_dataset_and_both_network_stages(
             dataset_obs_temporal_downsample_ratio=4,
             extended_obs_dict=batch["extended_obs"],
         )
-    assert result["action_pred"].shape == (2, 32, 14)
-    assert result["action"].shape == (2, 25, 14)
+    assert result["action_pred"].shape == (2, 32, 7)
+    assert result["action"].shape == (2, 25, 7)
     assert torch.isfinite(result["action"]).all()
 
 
@@ -376,6 +426,7 @@ def test_rgb_5hz_and_proprio_20hz_are_sampled_independently(
     for key in (
         "right_robot_joint_pos",
         "right_robot_joint_vel",
+        "right_robot_tcp_pose",
         "right_robot_tcp_wrench",
     ):
         np.testing.assert_allclose(
@@ -390,14 +441,18 @@ def test_rgb_5hz_and_proprio_20hz_are_sampled_independently(
                 raw_start + (local - 7) * 3 : raw_start + local * 3 + 1 : 3
             ],
         )
+    obs_index = raw_start + local * 3
+    target_index = obs_index + 3
     np.testing.assert_allclose(
-        sample["action"][7],
-        root["data/right_robot_command"][raw_start + (local + 1) * 3],
+        sample["action"][7, :3],
+        root["data/right_robot_tcp_command"][target_index, :3]
+        - root["data/right_robot_tcp_pose"][obs_index, :3],
+        atol=1e-6,
     )
-    assert not np.allclose(
-        sample["action"][7], root["data/right_robot_command"][raw_start + local * 3]
-    )  # The label is 50 ms ahead of the same-time Zarr action.
-    assert root["data/command"].shape == (120, 28)  # Source data is unchanged.
+    np.testing.assert_allclose(
+        sample["action"][7, 6], root["data/right_robot_command"][target_index, 6]
+    )
+    assert root["data/command"].shape == (120, 14)  # Source data is unchanged.
 
 
 def test_resampling_validates_rates_and_preserves_episode_boundaries(
@@ -496,6 +551,9 @@ def test_slow_visual_and_proprio_precede_fast_state_and_command_by_two_ticks(
         root["data/right_robot_joint_pos"][12 * 3],
     )
     np.testing.assert_allclose(
-        sample["action"][7], root["data/right_robot_command"][13 * 3]
+        sample["action"][7, :3],
+        root["data/right_robot_tcp_command"][13 * 3, :3]
+        - root["data/right_robot_tcp_pose"][12 * 3, :3],
+        atol=1e-6,
     )
     np.testing.assert_allclose(sample["obs"]["external_img"][-1, 0, 0, 0] * 255, 8 * 3)
