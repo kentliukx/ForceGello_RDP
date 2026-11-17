@@ -71,6 +71,36 @@ class BaseWorkspace:
     def get_checkpoint_path(self, tag='latest'):
         return pathlib.Path(self.output_dir).joinpath('checkpoints', f'{tag}.ckpt')
 
+    def save_deploy_checkpoint(self, path, model_key='model'):
+        """Save only the weights used by inference, keeping latest.ckpt resumable."""
+        model = getattr(self, model_key)
+        if not hasattr(model, 'state_dict') or not hasattr(model, 'load_state_dict'):
+            raise ValueError(f'{model_key} is not a checkpointable model')
+
+        # The full latest.ckpt save may still be running on a background thread.
+        if self._saving_thread is not None:
+            self._saving_thread.join()
+
+        exclude_keys = tuple(
+            key for key, value in self.__dict__.items()
+            if key != model_key
+            and hasattr(value, 'state_dict')
+            and hasattr(value, 'load_state_dict')
+        )
+        path = pathlib.Path(path)
+        partial_path = path.with_name(f'.{path.name}.partial')
+        try:
+            self.save_checkpoint(
+                path=partial_path,
+                exclude_keys=exclude_keys,
+                include_keys=(),
+                use_thread=False,
+            )
+            partial_path.replace(path)
+        finally:
+            partial_path.unlink(missing_ok=True)
+        return str(path.absolute())
+
     def load_payload(self, payload, exclude_keys=None, include_keys=None, **kwargs):
         if exclude_keys is None:
             exclude_keys = tuple()

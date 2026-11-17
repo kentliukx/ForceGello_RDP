@@ -9,5 +9,15 @@ policy:
   at:
     device: ${training.device}
 
+training:
+  checkpoint_every: 20
+
+checkpoint:
+  deploy_only_topk: true
+  topk:
+    monitor_key: val_loss
+    k: ${training.num_epochs}
+    format_str: 'epoch={epoch:04d}-val_loss={val_loss:.6f}-deploy.ckpt'
+
 logging:
   mode: offline
