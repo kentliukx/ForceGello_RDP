@@ -132,6 +132,10 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
             if lastest_ckpt_path.is_file():
                 accelerator.print(f"Resuming from checkpoint {lastest_ckpt_path}")
                 self.load_checkpoint(path=lastest_ckpt_path)
+                # Checkpoints are written after an epoch finishes, before the
+                # bookkeeping increments at the bottom of the loop.
+                self.epoch += 1
+                self.global_step += 1
 
         # configure dataset
         dataset: BaseImageDataset
@@ -228,7 +232,7 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         # training loop
         log_path = os.path.join(self.output_dir, 'logs.json.txt')
         with JsonLogger(log_path) as json_logger:
-            for local_epoch_idx in range(cfg.training.num_epochs):
+            for local_epoch_idx in range(self.epoch, cfg.training.num_epochs):
                 step_log = dict()
                 # ========= train for this epoch ==========
                 if cfg.training.freeze_encoder:
@@ -300,7 +304,7 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                                 leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                             for batch_idx, batch in enumerate(tepoch):
                                 batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                                loss = self.model(batch)
+                                loss = policy(batch)
                                 val_losses.append(loss)
                                 if (cfg.training.max_val_steps is not None) \
                                     and batch_idx >= (cfg.training.max_val_steps-1):
