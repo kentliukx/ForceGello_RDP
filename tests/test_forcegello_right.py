@@ -32,6 +32,30 @@ CONFIG_DIR = Path(__file__).resolve().parents[1] / "reactive_diffusion_policy/co
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
 
+def test_raw_and_ema_validation_share_diffusion_randomness() -> None:
+    from reactive_diffusion_policy.workspace.train_diffusion_unet_image_workspace import (
+        paired_validation_losses,
+    )
+
+    class RandomLoss:
+        def __init__(self, offset: float):
+            self.offset = offset
+
+        def __call__(self, batch: dict) -> torch.Tensor:
+            return torch.randn((), device=batch["action"].device) + self.offset
+
+    torch.manual_seed(42)
+    expected_noise = torch.randn(()).item()
+    expected_next = torch.randn(()).item()
+    torch.manual_seed(42)
+    raw_loss, ema_loss = paired_validation_losses(
+        RandomLoss(1.0), RandomLoss(2.0), {"action": torch.zeros(1, 7)}
+    )
+    assert raw_loss.item() == pytest.approx(expected_noise + 1.0)
+    assert ema_loss.item() == pytest.approx(expected_noise + 2.0)
+    assert torch.randn(()).item() == pytest.approx(expected_next)
+
+
 @pytest.fixture
 def robot_xml() -> Path:
     return load_model(
