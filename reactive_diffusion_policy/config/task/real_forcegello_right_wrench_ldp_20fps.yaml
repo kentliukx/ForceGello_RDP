@@ -40,13 +40,10 @@ shape_meta:
     right_robot_joint_vel:
       shape: [7]
       type: low_dim
-    right_robot_tcp_wrench:
-      shape: [6]
-      type: low_dim
   action:
     key: right_robot_command
     space: joint
-    shape: [14]
+    shape: [7]
 
 dataset:
   _target_: reactive_diffusion_policy.dataset.real_image_tactile_latent_diffusion_dataset.RealImageTactileLatentDiffusionDataset

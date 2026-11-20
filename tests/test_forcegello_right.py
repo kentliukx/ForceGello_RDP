@@ -130,9 +130,9 @@ def test_conversion_aligns_each_leader_command_with_the_current_observation(
 ) -> None:
     root = zarr.open_group(str(converted / "replay_buffer.zarr"), mode="r")
     data = root["data"]
-    assert root.attrs["schema"] == "forcegello.bimanual_joint.v1"
+    assert root.attrs["schema"] == "forcegello.bimanual_joint.v2"
     np.testing.assert_array_equal(root["meta/episode_ends"], [60, 120])
-    assert data["command"].shape == (120, 28)
+    assert data["command"].shape == (120, 14)
     assert data["right_robot_tcp_pose"].shape == (120, 9)
     assert data["right_robot_tcp_wrench"].shape == (120, 6)
     assert data["right_robot_jacobian"].shape == (120, 6, 6)
@@ -165,10 +165,10 @@ def test_conversion_aligns_each_leader_command_with_the_current_observation(
                 data["robot_source_monotonic_ns"][start:end, 0 if side == "left" else 1],
                 [row["monotonic_ns"] for row in raw],
             )
-            assert data[f"{side}_robot_command"].shape == (120, 14)
-            np.testing.assert_allclose(data[f"{side}_robot_command"][start:end, -1], 0)
-    np.testing.assert_allclose(data["command"][:, :14], data["left_robot_command"][:])
-    np.testing.assert_allclose(data["command"][:, 14:], data["right_robot_command"][:])
+            assert data[f"{side}_robot_command"].shape == (120, 7)
+            np.testing.assert_allclose(data[f"{side}_leader_joint_vel"][start:end, -1], 0)
+    np.testing.assert_allclose(data["command"][:, :7], data["left_robot_command"][:])
+    np.testing.assert_allclose(data["command"][:, 7:], data["right_robot_command"][:])
     assert "target" not in data and "action_monotonic_ns" not in data
     assert "action_source_monotonic_ns" not in data
     assert data["timestamp"].dtype == np.float64
@@ -227,7 +227,7 @@ def config(name: str, overrides: list[str]):
 
 
 @pytest.mark.parametrize(
-    "key,dim", [("left_robot_command", 14), ("right_robot_command", 14), ("command", 28)]
+    "key,dim", [("left_robot_command", 7), ("right_robot_command", 7), ("command", 14)]
 )
 def test_action_selection_and_joint_normalization(
     converted: Path, key: str, dim: int
@@ -275,9 +275,9 @@ def test_right_arm_dataset_and_both_network_stages(
     )
     dataset = hydra.utils.instantiate(cfg.task.dataset)
     batch = next(iter(DataLoader(dataset, batch_size=2)))
-    assert batch["action"].shape == (2, 32, 14)
+    assert batch["action"].shape == (2, 32, 7)
     assert batch["obs"]["right_robot_joint_pos"].shape == (2, 2, 7)
-    assert batch["extended_obs"]["right_robot_tcp_wrench"].shape == (2, 32, 6)
+    assert "right_robot_tcp_wrench" not in batch["extended_obs"]
     assert batch["extended_obs"]["right_robot_joint_pos"].shape == (2, 32, 7)
     assert batch["extended_obs"]["right_robot_joint_vel"].shape == (2, 32, 7)
     assert not any(key.startswith("left") for key in batch["obs"])
@@ -330,8 +330,8 @@ def test_right_arm_dataset_and_both_network_stages(
             dataset_obs_temporal_downsample_ratio=4,
             extended_obs_dict=batch["extended_obs"],
         )
-    assert result["action_pred"].shape == (2, 32, 14)
-    assert result["action"].shape == (2, 25, 14)
+    assert result["action_pred"].shape == (2, 32, 7)
+    assert result["action"].shape == (2, 25, 7)
     assert torch.isfinite(result["action"]).all()
 
 
@@ -384,12 +384,13 @@ def test_rgb_5hz_and_proprio_20hz_are_sampled_independently(
                 raw_start + (local - 1) * 3 : raw_start + local * 3 + 1 : 3
             ],
         )
-        np.testing.assert_allclose(
-            sample["extended_obs"][key][:8],
-            root[f"data/{key}"][
-                raw_start + (local - 7) * 3 : raw_start + local * 3 + 1 : 3
-            ],
-        )
+        if key != "right_robot_tcp_wrench":
+            np.testing.assert_allclose(
+                sample["extended_obs"][key][:8],
+                root[f"data/{key}"][
+                    raw_start + (local - 7) * 3 : raw_start + local * 3 + 1 : 3
+                ],
+            )
     np.testing.assert_allclose(
         sample["action"][7],
         root["data/right_robot_command"][raw_start + (local + 1) * 3],
@@ -397,7 +398,7 @@ def test_rgb_5hz_and_proprio_20hz_are_sampled_independently(
     assert not np.allclose(
         sample["action"][7], root["data/right_robot_command"][raw_start + local * 3]
     )  # The label is 50 ms ahead of the same-time Zarr action.
-    assert root["data/command"].shape == (120, 28)  # Source data is unchanged.
+    assert root["data/command"].shape == (120, 14)  # Source data is unchanged.
 
 
 def test_resampling_validates_rates_and_preserves_episode_boundaries(
