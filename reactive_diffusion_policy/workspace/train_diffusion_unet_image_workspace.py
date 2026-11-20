@@ -33,6 +33,20 @@ from accelerate import Accelerator
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
+
+def paired_validation_losses(raw_policy, ema_policy, batch):
+    """Evaluate both weights with the same diffusion noise and timesteps."""
+    cpu_rng_state = torch.random.get_rng_state()
+    device = batch['action'].device
+    cuda_rng_state = torch.cuda.get_rng_state(device) if device.type == 'cuda' else None
+    ema_loss = ema_policy(batch)
+    torch.random.set_rng_state(cpu_rng_state)
+    if cuda_rng_state is not None:
+        torch.cuda.set_rng_state(cuda_rng_state, device)
+    raw_loss = raw_policy(batch)
+    return raw_loss.detach(), ema_loss.detach()
+
+
 class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
     include_keys = ['global_step', 'epoch']
 
@@ -291,28 +305,38 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                 step_log['train_loss'] = train_loss
 
                 # ========= eval for this epoch ==========
-                policy = accelerator.unwrap_model(self.model)
-                if cfg.training.use_ema:
-                    policy = self.ema_model
+                raw_policy = accelerator.unwrap_model(self.model)
+                policy = self.ema_model if cfg.training.use_ema else raw_policy
                 policy.eval()
+                log_both_val_losses = cfg.training.get('log_both_validation_losses', False) and cfg.training.use_ema
+                if log_both_val_losses:
+                    raw_policy.eval()
 
                 # run validation
                 if cfg.task.dataset.val_ratio > 0 and (self.epoch % cfg.training.val_every) == 0 and accelerator.is_main_process:
                     with torch.no_grad():
                         val_losses = list()
+                        raw_val_losses = list()
                         with tqdm.tqdm(val_dataloader, desc=f"Validation epoch {self.epoch}", 
                                 leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                             for batch_idx, batch in enumerate(tepoch):
                                 batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                                loss = policy(batch)
-                                val_losses.append(loss)
+                                if log_both_val_losses:
+                                    raw_loss, ema_loss = paired_validation_losses(raw_policy, policy, batch)
+                                    raw_val_losses.append(raw_loss)
+                                    val_losses.append(ema_loss)
+                                else:
+                                    val_losses.append(policy(batch).detach())
                                 if (cfg.training.max_val_steps is not None) \
                                     and batch_idx >= (cfg.training.max_val_steps-1):
                                     break
                         if len(val_losses) > 0:
-                            val_loss = torch.mean(torch.tensor(val_losses)).item()
-                            # log epoch average validation loss
+                            val_loss = torch.stack(val_losses).mean().item()
+                            # Keep val_loss as the EMA metric used by checkpoint selection.
                             step_log['val_loss'] = val_loss
+                            if log_both_val_losses:
+                                step_log['val_loss_ema'] = val_loss
+                                step_log['val_loss_raw'] = torch.stack(raw_val_losses).mean().item()
 
                 # run diffusion sampling on a training batch
                 if (self.epoch % cfg.training.sample_every) == 0:
@@ -379,6 +403,8 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                     
                 # ========= eval end for this epoch ==========
                 policy.train()
+                if log_both_val_losses:
+                    raw_policy.train()
 
                 # end of epoch
                 # log of last step is combined with validation and rollout

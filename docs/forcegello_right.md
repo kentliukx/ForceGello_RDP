@@ -191,6 +191,9 @@ DATASET_PATH=../i2rt/data/forcegello_zarr bash train_rdp.sh
 AT 和 RDP 每隔 20 个 epoch 保留一个 `epoch=...-val_loss=...-deploy.ckpt`，其中 AT 只保存
 `model`，RDP 只保存部署使用的 `ema_model`；这些文件不能用来续训。
 各阶段的 `checkpoints/latest.ckpt` 仍保存完整训练状态，可用于断点恢复。
+二阶段每个 epoch 的 `logs.json.txt` 记录原始权重的 `train_loss` 和 `val_loss_raw`，
+以及 EMA 权重的 `val_loss_ema`；保留 `val_loss = val_loss_ema` 供 checkpoint 选优使用。
+两个验证 loss 在相同 batch、扩散噪声和时间步上计算。
 YAM 的无 ROS 在线执行入口为 [i2rt/examples/rdp_policy/run.py](../../i2rt/examples/rdp_policy/README.md)，
 反归一化后的七维作为位置目标；部署端以相邻目标位置差分生成前六个关节的速度目标，夹爪速度为 0。
 

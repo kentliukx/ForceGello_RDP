@@ -14,6 +14,7 @@ policy:
 
 training:
   checkpoint_every: 20
+  log_both_validation_losses: true
 
 checkpoint:
   deploy_only_topk: true
