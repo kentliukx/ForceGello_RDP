@@ -251,7 +251,7 @@ def config(name: str, overrides: list[str]):
 
 
 @pytest.mark.parametrize(
-    "key,dim", [("left_robot_command", 14), ("right_robot_command", 14), ("command", 28)]
+    "key,dim", [("left_robot_command", 14), ("right_robot_command", 7), ("command", 28)]
 )
 def test_action_selection_and_joint_normalization(
     converted: Path, key: str, dim: int
@@ -275,7 +275,7 @@ def test_action_selection_and_joint_normalization(
     ])
     expected = zarr.open_group(str(converted / "replay_buffer.zarr"), mode="r")[
         f"data/{key}"
-    ].oindex[expected_indices]
+    ].oindex[expected_indices][:, :dim]
     np.testing.assert_allclose(dataset.get_all_actions().numpy(), expected)
     assert dataset[0]["action"].shape == (32, dim)
     normalizer = dataset.get_normalizer()["action"]
@@ -299,8 +299,9 @@ def test_right_arm_dataset_and_both_network_stages(
     )
     dataset = hydra.utils.instantiate(cfg.task.dataset)
     batch = next(iter(DataLoader(dataset, batch_size=2)))
-    assert batch["action"].shape == (2, 32, 14)
+    assert batch["action"].shape == (2, 32, 7)
     assert batch["obs"]["right_robot_joint_pos"].shape == (2, 2, 7)
+    assert batch["obs"]["right_robot_tcp_wrench"].shape == (2, 2, 6)
     assert batch["extended_obs"]["right_robot_tcp_wrench"].shape == (2, 32, 6)
     assert batch["extended_obs"]["right_robot_joint_pos"].shape == (2, 32, 7)
     assert batch["extended_obs"]["right_robot_joint_vel"].shape == (2, 32, 7)
@@ -312,7 +313,7 @@ def test_right_arm_dataset_and_both_network_stages(
     ])
     expected = zarr.open_group(str(converted / "replay_buffer.zarr"), mode="r")[
         "data/right_robot_command"
-    ].oindex[expected_indices]
+    ].oindex[expected_indices][:, :7]
     np.testing.assert_allclose(dataset.get_all_actions().numpy(), expected)
     normalizer = dataset.get_normalizer()
     tokenizer = hydra.utils.instantiate(cfg.policy)
@@ -353,8 +354,8 @@ def test_right_arm_dataset_and_both_network_stages(
             dataset_obs_temporal_downsample_ratio=4,
             extended_obs_dict=batch["extended_obs"],
         )
-    assert result["action_pred"].shape == (2, 32, 14)
-    assert result["action"].shape == (2, 25, 14)
+    assert result["action_pred"].shape == (2, 32, 7)
+    assert result["action"].shape == (2, 25, 7)
     assert torch.isfinite(result["action"]).all()
 
 
@@ -415,10 +416,10 @@ def test_rgb_5hz_and_proprio_20hz_are_sampled_independently(
         )
     np.testing.assert_allclose(
         sample["action"][7],
-        root["data/right_robot_command"][raw_start + (local + 1) * 3],
+        root["data/right_robot_command"][raw_start + (local + 1) * 3, :7],
     )
     assert not np.allclose(
-        sample["action"][7], root["data/right_robot_command"][raw_start + local * 3]
+        sample["action"][7], root["data/right_robot_command"][raw_start + local * 3, :7]
     )  # The label is 50 ms ahead of the same-time Zarr action.
     assert root["data/command"].shape == (120, 28)  # Source data is unchanged.
 
@@ -556,6 +557,6 @@ def test_slow_visual_and_proprio_precede_fast_state_and_command_by_two_ticks(
         root["data/right_robot_joint_pos"][12 * 3],
     )
     np.testing.assert_allclose(
-        sample["action"][7], root["data/right_robot_command"][13 * 3]
+        sample["action"][7], root["data/right_robot_command"][13 * 3, :7]
     )
     np.testing.assert_allclose(sample["obs"]["external_img"][-1, 0, 0, 0] * 255, 8 * 3)

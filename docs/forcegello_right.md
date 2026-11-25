@@ -2,11 +2,11 @@
 
 由 i2rt 转换的 Zarr 为左右臂保存对称的实测状态、主臂状态和同帧命令，并保留三路 RGB。
 即使只启用右臂遥操作，左臂仍保存真实记录；不按黄色按钮状态筛选，不填充伪造的左臂或触觉数据。
-默认网络从统一数据中选择顶部、右腕图像及右臂状态，输出右臂关节命令。
+默认网络从统一数据中选择顶部、右腕图像及右臂状态，输出右臂 7 维绝对关节位置目标。
 
 ## 动作定义
 
-每个机械臂的命令为 **14 维**，与采集器给从臂的 `pos7/vel7` 参数布局一致：
+源 Zarr 中每个机械臂的命令为 **14 维**，与采集器给从臂的 `pos7/vel7` 参数布局一致：
 
 ```text
 [q1,q2,q3,q4,q5,q6,gripper, dq1,dq2,dq3,dq4,dq5,dq6,0]
@@ -15,6 +15,7 @@
 
 前六个位置/速度来自主臂实测值，单位 rad、rad/s；第七个位置是手柄的归一化夹爪输入。
 夹爪速度目标固定为 0，与采集器一致，不用手柄开度差分伪造速度。
+网络只预测前 7 维绝对位置目标 `[q1..q6,gripper]`；部署时前六个关节的速度目标由相邻 20 Hz 位置命令差分并除以 0.05 秒得到，夹爪速度固定为 0。
 
 **源 Zarr 中 `side_robot_command[t] = side_leader_pos7_vel7[t]`**，
 与从臂观测使用同一条对齐后的 60 Hz 记录；不是从臂的 TCP 或关节状态。
@@ -52,7 +53,7 @@ uv run --extra collection --with 'zarr>=2.16,<3' --with 'numcodecs<0.16' \
 设为 `null` 时才使用 0、1、2 三相，并按原始轨迹一起划入训练集或验证集。
 图像在选中的时间轴上每 4 帧更新一次，模拟 5 Hz 保持。训练时按索引从原始 Zarr 读取，
 不复制图像，也不修改源 Zarr。
-训练动作从原始 `command` 取下一个选中时刻（50 ms 后）的主臂命令；
+训练动作从原始 `right_robot_command` 取下一个选中时刻（50 ms 后）的前 7 维主臂位置命令；
 每段没有有效下一选中帧的末尾被丢弃。原始 Zarr 的命令列本身没有未来偏移。
 二阶段训练设置 `slow_obs_latency_steps: 1`：慢策略输入是 t 的图像和本体状态，
 动作段与快策略本体状态从 t+1 对齐。向量最早在 t+1（50 ms 后）进入快解码，
@@ -158,11 +159,11 @@ extended_obs:
 action:
   key: right_robot_command
   space: joint
-  shape: [14]
+  shape: [7]
 ```
 
 `obs` 只加载网络需要的字段；完整 Zarr 不随网络输入配置改变。
-训练左臂时将 obs 中的右臂字段换成左臂，并选择 `left_robot_command`；双臂训练同时选择两侧 obs，并选择全局 `command`、维度 28。
+训练左臂时将 obs 中的右臂字段换成左臂，并选择 `left_robot_command` 的前 7 维；双臂任务需要分别指定两侧的 7 维位置目标，不能直接把旧的 28 维 `command` 当作 14 维新动作。
 关节命令按每维范围归一化，不使用 TCP 的相对位姿变换；`relative_action=False`。
 
 - 训练与部署均为：动作、关节位置、速度和 wrench **20 Hz**；视觉和慢扩散推理 **5 Hz**。
@@ -170,15 +171,15 @@ action:
 - 图像在每段轨迹的 5 Hz 时钟上取样保持，不使用未来帧。
 - 快 GRU 每个 20 Hz 控制周期接收位置7、速度7、wrench6，合计 **20 维**反馈。
 - Chunk 恢复 **32 步**（20 Hz，1.6 秒的序列）；原 RDP 公式使用 8 步观测前缀，返回 25 步可执行动作。
-- AT 编码器输入 `(B,32,14)`，GRU 训练条件 `(B,32,20)`，完整解码 `(B,32,14)`，可执行部分 `(B,25,14)`。
+- AT 编码器输入 `(B,32,7)`，GRU 训练条件 `(B,32,20)`，完整解码 `(B,32,7)`，可执行部分 `(B,25,7)`。
 - 卷积 AT 将 32 个动作编码成长度 8、每项 16 维的 latent。
 - 默认 task 为 `real_forcegello_right_wrench_at_20fps` / `real_forcegello_right_wrench_ldp_20fps`；
   原 `_60fps` 配置名作为兼容别名指向这两份新配置。
 
-需要重新训练 AT 和 LDP；旧 60 Hz checkpoint 的时间定义与网络序列长度不适用于当前部署默认值。
+需要重新训练 AT 和 LDP；旧 14 维动作 checkpoint 不能用于 7 维部署入口。
 源 Zarr 的 `command[t] = 主臂[t]`，`t` 为 60 Hz；训练样本每 3 帧取一帧形成 20 Hz，
 标签取该样本之后的第 3 个源帧，即 `action_train[t] = command_zarr[t+3]`（50 ms 后）。
-观测与主臂动作均按实测帧取值，不插值，速度保留 rad/s。
+观测与主臂动作均按实测帧取值，不插值；源 Zarr 的主臂速度仍保留作诊断，但不进入网络动作标签。
 在 RDP 训练环境中：
 
 ```bash
@@ -195,11 +196,11 @@ AT 和 RDP 每隔 20 个 epoch 保留一个 `epoch=...-val_loss=...-deploy.ckpt`
 以及 EMA 权重的 `val_loss_ema`；保留 `val_loss = val_loss_ema` 供 checkpoint 选优使用。
 两个验证 loss 在相同 batch、扩散噪声和时间步上计算。
 YAM 的无 ROS 在线执行入口为 [i2rt/examples/rdp_policy/run.py](../../i2rt/examples/rdp_policy/README.md)，
-直接把反归一化后的前七维、后七维交给从臂 pos/vel 控制接口；慢扩散与实时 GRU 解码分开运行。
+反归一化后的七维用作下一位置目标，部署端按 20 Hz 相邻目标差分生成前六个关节的速度目标，夹爪速度为 0；慢扩散与实时 GRU 解码分开运行。
 
 原 RDP 的 `initial_marker`、`marker_offset` 是 GelSight/McTac 触觉胶面标记点的位置和位移，
 `marker_offset_emb` 是其 PCA 特征；此数据中不包含这些触觉字段或伪造的夹爪力。
 
 验证：`python -m pytest tests/test_forcegello_right.py -q`。
 测试使用不同的主臂/从臂、左右臂数据检查来源选择、下一帧标签、末帧与缺口边界，
-并验证两阶段网络前向、反向及 14 维解码。网络冒烟测试使用较小的 U-Net 隐藏通道数。
+并验证两阶段网络前向、反向及 7 维解码。网络冒烟测试使用较小的 U-Net 隐藏通道数。

@@ -36,7 +36,7 @@ shape_meta:
   action:
     key: right_robot_command
     space: joint
-    shape: [14]
+    shape: [7]
 
 dataset:
   _target_: reactive_diffusion_policy.dataset.real_image_tactile_dataset.RealImageTactileDataset
