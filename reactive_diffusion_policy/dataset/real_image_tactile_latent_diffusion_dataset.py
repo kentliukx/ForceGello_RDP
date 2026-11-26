@@ -1,9 +1,7 @@
 import einops
 import numpy as np
 import tqdm
-import copy
 import torch
-from reactive_diffusion_policy.common.replay_buffer import ReplayBuffer
 from reactive_diffusion_policy.model.vae.model import VAE
 from reactive_diffusion_policy.dataset.real_image_tactile_dataset import RealImageTactileDataset
 from reactive_diffusion_policy.model.common.normalizer import LinearNormalizer, SingleFieldLinearNormalizer
@@ -22,27 +20,10 @@ class RealImageTactileLatentDiffusionDataset(RealImageTactileDataset):
         normalizer = super().get_normalizer(**kwargs)
 
         latent_action_all = []
-        if self.action_space == 'joint' and not self.relative_action:
-            # The latent statistics need only actions. Reading two camera images
-            # for every overlapping window would turn the lazy three-phase view
-            # into a very expensive full-dataset image scan.
-            action_values = self.replay_buffer[self.action_key][
-                :, :self.shape_meta['action']['shape'][0]
-            ]
-            action_buffer = ReplayBuffer({
-                'data': {self.action_key: action_values},
-                'meta': {'episode_ends': self.replay_buffer.episode_ends[:]},
-            })
-            action_sampler = copy.copy(self.sampler)
-            action_sampler.replay_buffer = action_buffer
-            action_sampler.keys = [self.action_key]
-            def iter_actions():
-                for idx in range(len(action_sampler)):
-                    values = action_sampler.sample_sequence(idx)[self.action_key]
-                    if self.n_latency_steps:
-                        values = values[self.n_latency_steps:]
-                    yield torch.from_numpy(values.astype(np.float32))
-            actions = iter_actions()
+        if self.action_space == 'joint':
+            # Use the exact same fixed-anchor action windows as stage 1 and
+            # avoid reading cameras during latent-statistics calculation.
+            actions = (torch.from_numpy(value) for value in self.iter_joint_action_windows())
         else:
             actions = (sample['action'] for sample in self)
 

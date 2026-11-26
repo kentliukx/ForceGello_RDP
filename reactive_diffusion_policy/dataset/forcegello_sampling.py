@@ -74,7 +74,11 @@ def load_joint_replay(zarr_path, keys, action_key, sample_hz, sample_phase=None)
             for key in keys if key != action_key}
     # Raw command[t] is concurrent with observation[t]. The training action
     # label is the command one training step later, never from another episode.
-    data[action_key] = IndexedArray(source["data"][action_key], indices + stride)
+    commands = IndexedArray(source["data"][action_key], indices + stride)
+    # Relative action is window-dependent: the entire chunk uses the slow
+    # observation at its start as one fixed anchor, so it is applied in the
+    # dataset after SequenceSampler selects a window.
+    data[action_key] = commands
     replay = ReplayBuffer(
         {
             "data": data,

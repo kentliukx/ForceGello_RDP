@@ -38,6 +38,8 @@ class RealImageTactileDataset(BaseImageDataset):
                  sample_hz=None,
                  sample_phase=None,
                  slow_obs_latency_steps=0,
+                 relative_joint_anchor=None,
+                 absolute_gripper_action=False,
                  ):
         assert os.path.isdir(dataset_path)
         self.action_key = shape_meta['action'].get('key', 'action')
@@ -48,8 +50,22 @@ class RealImageTactileDataset(BaseImageDataset):
         self.action_space = shape_meta['action'].get('space', 'cartesian')
         if self.action_space not in ('cartesian', 'joint'):
             raise ValueError(f"unsupported action space: {self.action_space}")
-        if self.action_space == 'joint' and (delta_action or relative_action):
-            raise ValueError("joint pos/vel targets must use delta_action=False and relative_action=False")
+        if self.action_space == 'joint' and delta_action:
+            raise ValueError("joint targets do not support delta_action; use relative_action")
+        if self.action_space == 'joint' and relative_action and sample_hz is None:
+            raise ValueError("relative joint actions require sample_hz resampling")
+        if self.action_space == 'joint' and relative_action and list(shape_meta['action']['shape']) != [7]:
+            raise ValueError("relative joint actions require a 7D action target")
+        self.relative_joint_anchor = relative_joint_anchor
+        self.absolute_gripper_action = absolute_gripper_action
+        self.joint_anchor_key = self.action_key.removesuffix('_command') + '_joint_pos'
+        if self.action_space == 'joint' and relative_action:
+            if not self.action_key.endswith('_command') or relative_joint_anchor != 'slow_observation':
+                raise ValueError("relative joint actions require a fixed slow_observation anchor")
+            if self.slow_obs_latency_steps != 1:
+                raise ValueError("fixed joint anchor requires slow_obs_latency_steps=1")
+            if self.joint_anchor_key not in shape_meta['obs'] or list(shape_meta['obs'][self.joint_anchor_key]['shape']) != [7]:
+                raise ValueError("relative joint actions require a 7D slow joint position observation")
 
         rgb_keys = list()
         lowdim_keys = list()
@@ -73,10 +89,12 @@ class RealImageTactileDataset(BaseImageDataset):
 
         zarr_path = os.path.join(dataset_path, 'replay_buffer.zarr')
         zarr_load_keys = set(rgb_keys + lowdim_keys + extended_rgb_keys + extended_lowdim_keys + [self.action_key])
+        if self.action_space == 'joint' and relative_action:
+            zarr_load_keys.add(self.joint_anchor_key)
         zarr_load_keys = list(filter(lambda key: "wrt" not in key, zarr_load_keys))
         if sample_hz is not None:
-            if self.action_space != 'joint' or delta_action or relative_action:
-                raise ValueError("sample_hz resampling requires absolute joint actions")
+            if self.action_space != 'joint' or delta_action:
+                raise ValueError("sample_hz resampling requires joint actions without delta_action")
             from reactive_diffusion_policy.dataset.forcegello_sampling import load_joint_replay
             replay_buffer = load_joint_replay(
                 zarr_path, zarr_load_keys, self.action_key, float(sample_hz),
@@ -182,7 +200,7 @@ class RealImageTactileDataset(BaseImageDataset):
                     inter_gripper_data_dict[key].append(data['obs'][key])
             inter_gripper_data_dict = dict_apply(inter_gripper_data_dict, np.stack)
 
-        if self.relative_action:
+        if self.relative_action and self.action_space != 'joint':
             relative_data_dict = {key: list() for key in (self.lowdim_keys + ['action']) if ('robot_tcp_pose' in key and 'wrt' not in key) or 'action' in key}
             for data in tqdm.tqdm(self, leave=False, desc='Calculating relative action/obs for normalizer'):
                 for key in relative_data_dict.keys():
@@ -193,7 +211,9 @@ class RealImageTactileDataset(BaseImageDataset):
             relative_data_dict = dict_apply(relative_data_dict, np.stack)
 
         # action
-        if self.relative_action:
+        if self.relative_action and self.action_space == 'joint':
+            action_all = np.stack(list(self.iter_joint_action_windows()))
+        elif self.relative_action and self.action_space != 'joint':
             action_all = relative_data_dict['action']
         else:
             action_all = self.replay_buffer[self.action_key][:, :self.shape_meta['action']['shape'][0]]
@@ -205,7 +225,7 @@ class RealImageTactileDataset(BaseImageDataset):
 
         # obs
         for key in list(set(self.lowdim_keys)):
-            if self.relative_action and key in relative_data_dict:
+            if self.relative_action and self.action_space != 'joint' and key in relative_data_dict:
                 normalizer[key] = get_action_normalizer(relative_data_dict[key])
             elif 'robot_tcp_pose' in key and 'wrt' in key:
                 normalizer[key] = get_action_normalizer(inter_gripper_data_dict[key])
@@ -220,7 +240,7 @@ class RealImageTactileDataset(BaseImageDataset):
                 assert self.shape_meta['extended_obs'][key]['shape'][0] == self.shape_meta['obs'][key]['shape'][0], \
                     f"Extended obs {key} has different shape from obs {key}"
             else:
-                if self.relative_action and key in relative_data_dict:
+                if self.relative_action and self.action_space != 'joint' and key in relative_data_dict:
                     normalizer[key] = get_action_normalizer(relative_data_dict[key])
                 elif 'robot_tcp_pose' in key and 'wrt' in key:
                     normalizer[key] = get_action_normalizer(inter_gripper_data_dict[key])
@@ -236,7 +256,35 @@ class RealImageTactileDataset(BaseImageDataset):
         return normalizer
 
     def get_all_actions(self) -> torch.Tensor:
+        if self.relative_action and self.action_space == 'joint':
+            raise ValueError('joint relative actions depend on each window anchor; use iter_joint_action_windows')
         return torch.from_numpy(self.replay_buffer[self.action_key][:, :self.shape_meta['action']['shape'][0]])
+
+    def iter_joint_action_windows(self):
+        """Yield action windows with one slow joint-position anchor per window.
+
+        Keep image arrays out of normalizer and latent-statistics passes.
+        """
+        if self.action_space != 'joint':
+            raise ValueError('joint action windows require a joint action space')
+        keys = [self.action_key]
+        if self.relative_action:
+            keys.append(self.joint_anchor_key)
+        action_sampler = copy.copy(self.sampler)
+        action_sampler.keys = keys
+        action_sampler.key_first_k = {}
+        for idx in range(len(action_sampler)):
+            data = action_sampler.sample_sequence(idx)
+            action = data[self.action_key][:, :7].astype(np.float32)
+            if self.n_latency_steps:
+                action = action[self.n_latency_steps:]
+            if self.relative_action:
+                prefix_steps = self.n_obs_steps if self.n_obs_steps is not None else self.horizon + self.n_latency_steps
+                base = data[self.joint_anchor_key][prefix_steps - 1 - self.slow_obs_latency_steps, :7]
+                action[:, :6] -= base.astype(np.float32)[None, :6]
+                if not self.absolute_gripper_action:
+                    action[:, 6] -= np.float32(base[6])
+            yield action
 
     def __len__(self):
         return len(self.sampler)
@@ -334,7 +382,12 @@ class RealImageTactileDataset(BaseImageDataset):
         if self.n_latency_steps > 0:
             action = action[self.n_latency_steps:]
         
-        if self.relative_action:
+        if self.relative_action and self.action_space == 'joint':
+            base = obs_dict[self.joint_anchor_key][-1]
+            action[:, :6] -= base[None, :6]
+            if not self.absolute_gripper_action:
+                action[:, 6] -= base[6]
+        elif self.relative_action and self.action_space != 'joint':
             base_absolute_action = np.concatenate([
                 obs_dict['left_robot_tcp_pose'][-1] if 'left_robot_tcp_pose' in obs_dict else np.array([]),
                 obs_dict['right_robot_tcp_pose'][-1] if 'right_robot_tcp_pose' in obs_dict else np.array([])

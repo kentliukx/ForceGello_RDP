@@ -184,7 +184,7 @@ You can also use your own data collection system to collect data and convert it 
 
 ## 📚 Training
 
-For the symmetric ForceGello dataset and right-arm joint-action training (Jacobian-estimated wrench), see
+For the symmetric ForceGello dataset and right-arm relative joint-action training (raw joint residual torque), see
 [双臂统一 Zarr 与右臂两阶段训练](docs/forcegello_right.md).
 `train_rdp.sh` now defaults to these right-arm configurations.
 

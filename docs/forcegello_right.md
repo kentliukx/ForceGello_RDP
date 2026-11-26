@@ -55,15 +55,15 @@ uv run --extra collection --with 'zarr>=2.16,<3' --with 'numcodecs<0.16' \
 不复制图像，也不修改源 Zarr。
 训练动作从原始 `right_robot_command` 取下一个选中时刻（50 ms 后）的前 7 维主臂位置命令；
 每段没有有效下一选中帧的末尾被丢弃。原始 Zarr 的命令列本身没有未来偏移。
-二阶段训练设置 `slow_obs_latency_steps: 1`：慢策略输入是 t 的图像和本体状态，
+两阶段训练都设置 `slow_obs_latency_steps: 1`：慢策略输入是 t 的图像和本体状态，
 动作段与快策略本体状态从 t+1 对齐。向量最早在 t+1（50 ms 后）进入快解码，
 该次快解码预测的命令在 t+2（100 ms 后）到达。图像和慢策略本体状态仍来自同一时刻；
-一阶段 AT 的动作与本体状态保持原有逐帧对齐。新 checkpoint 会保存这个延迟设置，
-部署按设置调整动作段起点；旧 checkpoint 沿用原来的零延迟对齐方式。
+一阶段 AT 和二阶段 RDP 的动作窗口仅对前六维减去 t 时刻的固定关节锚点，夹爪保留绝对开度。新 checkpoint 会保存这个延迟和锚点设置，
+部署按设置调整动作段起点；旧 checkpoint 不适用于固定锚点部署入口。
 三相增加了可训练的时间起点，但相邻相位共用图像和相近的动作，不等于三倍独立示范。
 机器人/图像最大年龄默认为 0.05/0.10 秒，缺失和过期处拆段，训练窗口不会跨越缺口。
 
-## Jacobian 末端力估计
+## 关节残余力矩与可选末端力估计
 
 左右臂都按各自从臂的当前关节位置，每帧重新计算正运动学及 `grasp_site` 的几何 Jacobian。
 不使用旧的 `cartesian.tcp_wrench_estimate` 缓存。
@@ -78,6 +78,8 @@ F_tcp  = [Rᵀ F_base[:3], Rᵀ F_base[3:]]
 
 `side_robot_tcp_wrench` 为局部 TCP 系的 `[Fx,Fy,Fz,Tx,Ty,Tz]`，单位 N、Nm。
 默认 `--damping 0.01 --wrench-sign 1`；估计仍包含摩擦、惯性、跟踪及模型误差，不是六维力传感器实测值。
+当前 AT/RDP 输入直接读取 `side_robot_joint_effort_external` 六维关节残余力矩（Nm）；
+Zarr 中的 TCP wrench 保留供其他任务使用，本训练和部署均不做 Jacobian 力反算。
 
 ## 最终 Zarr 格式
 
@@ -147,15 +149,13 @@ obs:
     type: low_dim
     n_obs_steps: 2
     temporal_downsample_ratio: 1
-  right_robot_tcp_wrench:
+  right_robot_joint_effort_external:
     shape: [6]
     type: low_dim
     n_obs_steps: 2
     temporal_downsample_ratio: 1
 extended_obs:
-  right_robot_joint_pos: {shape: [7], type: low_dim}
-  right_robot_joint_vel: {shape: [7], type: low_dim}
-  right_robot_tcp_wrench: {shape: [6], type: low_dim}
+  right_robot_joint_effort_external: {shape: [6], type: low_dim}
 action:
   key: right_robot_command
   space: joint
@@ -164,21 +164,24 @@ action:
 
 `obs` 只加载网络需要的字段；完整 Zarr 不随网络输入配置改变。
 训练左臂时将 obs 中的右臂字段换成左臂，并选择 `left_robot_command` 的前 7 维；双臂任务需要分别指定两侧的 7 维位置目标，不能直接把旧的 28 维 `command` 当作 14 维新动作。
-关节命令按每维范围归一化，不使用 TCP 的相对位姿变换；`relative_action=False`。
+`relative_action=True` 且 `absolute_gripper_action=True` 时，一个训练窗口的前 6 维动作共用慢观测时刻的关节角作为固定锚点：
+`action_window[k,:6] = command_zarr[k+50ms][:6] - follower_joint_pos_zarr[slow_anchor,:6]`；第 7 维为 `command_zarr[k+50ms][6]`。
+两阶段都设 `slow_obs_latency_steps: 1`，所以第一次可用快解码之前的慢观测是这个锚点；同一 latent 的后续快解码不会更换锚点。
+前六维是弧度增量，最后一维是归一化的绝对夹爪开度；不使用 TCP 位姿变换。
 
-- 训练与部署均为：动作、关节位置、速度和 wrench **20 Hz**；视觉和慢扩散推理 **5 Hz**。
+- 训练与部署均为：动作、关节位置、速度和关节残余力矩 **20 Hz**；视觉和慢扩散推理 **5 Hz**。
 - 慢策略每次取两帧视觉，间隔 4 个机器人周期（0.2 秒）；本体状态取当前与上一周期，间隔 50 ms。
 - 图像在每段轨迹的 5 Hz 时钟上取样保持，不使用未来帧。
-- 快 GRU 每个 20 Hz 控制周期接收位置7、速度7、wrench6，合计 **20 维**反馈。
+- 快 GRU 每个 20 Hz 控制周期只接收 **6 维关节残余力矩**；位置和速度仍供慢策略观测及固定动作锚点使用，不送入快解码器。
 - Chunk 恢复 **32 步**（20 Hz，1.6 秒的序列）；原 RDP 公式使用 8 步观测前缀，返回 25 步可执行动作。
-- AT 编码器输入 `(B,32,7)`，GRU 训练条件 `(B,32,20)`，完整解码 `(B,32,7)`，可执行部分 `(B,25,7)`。
+- AT 编码器输入 `(B,32,7)`，GRU 训练条件 `(B,32,6)`，完整解码 `(B,32,7)`，可执行部分 `(B,25,7)`。
 - 卷积 AT 将 32 个动作编码成长度 8、每项 16 维的 latent。
 - 默认 task 为 `real_forcegello_right_wrench_at_20fps` / `real_forcegello_right_wrench_ldp_20fps`；
   原 `_60fps` 配置名作为兼容别名指向这两份新配置。
 
-需要重新训练 AT 和 LDP；旧 14 维动作 checkpoint 不能用于 7 维部署入口。
+需要重新训练 AT 和 LDP；旧绝对动作或 TCP wrench checkpoint 不能用于当前部署入口。
 源 Zarr 的 `command[t] = 主臂[t]`，`t` 为 60 Hz；训练样本每 3 帧取一帧形成 20 Hz，
-标签取该样本之后的第 3 个源帧，即 `action_train[t] = command_zarr[t+3]`（50 ms 后）。
+标签取该样本之后的第 3 个源帧，仅前六维减去所属训练窗口的慢观测从臂状态；同一窗口的全部手臂标签使用同一个基准，夹爪保持绝对开度。
 观测与主臂动作均按实测帧取值，不插值；源 Zarr 的主臂速度仍保留作诊断，但不进入网络动作标签。
 在 RDP 训练环境中：
 
@@ -196,7 +199,7 @@ AT 和 RDP 每隔 20 个 epoch 保留一个 `epoch=...-val_loss=...-deploy.ckpt`
 以及 EMA 权重的 `val_loss_ema`；保留 `val_loss = val_loss_ema` 供 checkpoint 选优使用。
 两个验证 loss 在相同 batch、扩散噪声和时间步上计算。
 YAM 的无 ROS 在线执行入口为 [i2rt/examples/rdp_policy/run.py](../../i2rt/examples/rdp_policy/README.md)，
-反归一化后的七维用作下一位置目标，部署端按 20 Hz 相邻目标差分生成前六个关节的速度目标，夹爪速度为 0；慢扩散与实时 GRU 解码分开运行。
+反归一化后的七维加到所属 latent 的固定关节锚点，恢复下一位置目标；部署端按 20 Hz 相邻目标差分生成前六个关节的速度目标，夹爪速度为 0；慢扩散与实时 GRU 解码分开运行。
 
 原 RDP 的 `initial_marker`、`marker_offset` 是 GelSight/McTac 触觉胶面标记点的位置和位移，
 `marker_offset_emb` 是其 PCA 特征；此数据中不包含这些触觉字段或伪造的夹爪力。

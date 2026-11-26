@@ -264,6 +264,7 @@ def test_action_selection_and_joint_normalization(
             "task.dataset.val_ratio=0",
             f"task.shape_meta.action.key={key}",
             f"task.shape_meta.action.shape=[{dim}]",
+            "task.dataset.relative_action=False",
         ],
     )
     dataset = hydra.utils.instantiate(cfg.task.dataset)
@@ -301,22 +302,23 @@ def test_right_arm_dataset_and_both_network_stages(
     batch = next(iter(DataLoader(dataset, batch_size=2)))
     assert batch["action"].shape == (2, 32, 7)
     assert batch["obs"]["right_robot_joint_pos"].shape == (2, 2, 7)
-    assert batch["obs"]["right_robot_tcp_wrench"].shape == (2, 2, 6)
-    assert batch["extended_obs"]["right_robot_tcp_wrench"].shape == (2, 32, 6)
-    assert batch["extended_obs"]["right_robot_joint_pos"].shape == (2, 32, 7)
-    assert batch["extended_obs"]["right_robot_joint_vel"].shape == (2, 32, 7)
+    assert batch["obs"]["right_robot_joint_effort_external"].shape == (2, 2, 6)
+    assert set(batch["extended_obs"]) == {"right_robot_joint_effort_external"}
+    assert batch["extended_obs"]["right_robot_joint_effort_external"].shape == (2, 32, 6)
     assert not any(key.startswith("left") for key in batch["obs"])
     assert dataset.action_key == "right_robot_command"
-    expected_indices = np.concatenate([
-        np.arange(start + 3, end, 3)
-        for start, end in ((0, 60), (60, 120))
-    ])
-    expected = zarr.open_group(str(converted / "replay_buffer.zarr"), mode="r")[
-        "data/right_robot_command"
-    ].oindex[expected_indices][:, :7]
-    np.testing.assert_allclose(dataset.get_all_actions().numpy(), expected)
+    first = dataset.sampler.sample_sequence(0)
+    base = dataset[0]["obs"]["right_robot_joint_pos"][-1].numpy()
+    expected = first["right_robot_command"][:, :7].copy()
+    expected[:, :6] -= base[:6]
+    np.testing.assert_allclose(batch["action"][0].numpy(), expected)
+    with pytest.raises(ValueError, match="window anchor"):
+        dataset.get_all_actions()
+    assert cfg.task.dataset.relative_action
+    at_first_action = batch["action"][0].numpy().copy()
     normalizer = dataset.get_normalizer()
     tokenizer = hydra.utils.instantiate(cfg.policy)
+    assert tokenizer.rnn_temporal_cond_dim == 6
     tokenizer.set_normalizer(normalizer)
     loss = tokenizer.compute_loss_and_metric(batch)["loss"]
     assert torch.isfinite(loss)
@@ -339,6 +341,8 @@ def test_right_arm_dataset_and_both_network_stages(
     )
     dataset = hydra.utils.instantiate(cfg.task.dataset)
     batch = next(iter(DataLoader(dataset, batch_size=2)))
+    np.testing.assert_allclose(batch["action"][0].numpy(), at_first_action)
+    assert set(batch["extended_obs"]) == {"right_robot_joint_effort_external"}
     assert batch["obs"]["right_wrist_img"].shape == (2, 2, 3, 240, 320)
     assert batch["obs"]["external_img"].shape == (2, 2, 3, 240, 320)
     assert "left_wrist_img" not in batch["obs"]
@@ -400,7 +404,7 @@ def test_rgb_5hz_and_proprio_20hz_are_sampled_independently(
     for key in (
         "right_robot_joint_pos",
         "right_robot_joint_vel",
-        "right_robot_tcp_wrench",
+        "right_robot_joint_effort_external",
     ):
         np.testing.assert_allclose(
             sample["obs"][key],
@@ -408,12 +412,13 @@ def test_rgb_5hz_and_proprio_20hz_are_sampled_independently(
                 raw_start + (local - 1) * 3 : raw_start + local * 3 + 1 : 3
             ],
         )
-        np.testing.assert_allclose(
-            sample["extended_obs"][key][:8],
-            root[f"data/{key}"][
-                raw_start + (local - 7) * 3 : raw_start + local * 3 + 1 : 3
-            ],
-        )
+    assert set(sample["extended_obs"]) == {"right_robot_joint_effort_external"}
+    np.testing.assert_allclose(
+        sample["extended_obs"]["right_robot_joint_effort_external"][:8],
+        root["data/right_robot_joint_effort_external"][
+            raw_start + (local - 7) * 3 : raw_start + local * 3 + 1 : 3
+        ],
+    )
     np.testing.assert_allclose(
         sample["action"][7],
         root["data/right_robot_command"][raw_start + (local + 1) * 3, :7],
@@ -528,6 +533,27 @@ def test_both_stages_use_one_20hz_phase_with_future_joint_targets(converted: Pat
         load_joint_replay(path, ["right_robot_joint_pos"], "right_robot_command", 20, sample_phase=3)
 
 
+def test_relative_joint_chunk_uses_one_slow_observation_anchor(converted: Path) -> None:
+    from reactive_diffusion_policy.dataset.real_image_tactile_dataset import RealImageTactileDataset
+
+    cfg = config("train_forcegello_right_at", [])
+    dataset = RealImageTactileDataset(
+        shape_meta=cfg.task.shape_meta, dataset_path=str(converted),
+        horizon=32, pad_before=7, pad_after=24, n_obs_steps=8,
+        sample_hz=20, sample_phase=0, slow_obs_latency_steps=1,
+        relative_action=True, relative_joint_anchor="slow_observation",
+        absolute_gripper_action=True,
+    )
+    index = next(i for i, (_, _, padding, _) in enumerate(dataset.sampler.indices) if padding == 0)
+    sample = dataset[index]
+    raw = dataset.sampler.sample_sequence(index)
+    base = sample["obs"]["right_robot_joint_pos"][-1].numpy()
+    for step in (7, 8, 12):
+        np.testing.assert_allclose(sample["action"][step, :6], raw["right_robot_command"][step, :6] - base[:6])
+        np.testing.assert_allclose(sample["action"][step, 6], raw["right_robot_command"][step, 6])
+    np.testing.assert_allclose(next(dataset.iter_joint_action_windows()), dataset[0]["action"].numpy())
+
+
 def test_slow_visual_and_proprio_precede_fast_state_and_command_by_two_ticks(
     converted: Path,
 ) -> None:
@@ -540,7 +566,9 @@ def test_slow_visual_and_proprio_precede_fast_state_and_command_by_two_ticks(
         shape_meta=cfg.task.shape_meta, dataset_path=str(converted),
         horizon=32, pad_before=7, pad_after=24, n_obs_steps=8,
         obs_temporal_downsample_ratio=4, sample_hz=20,
-        slow_obs_latency_steps=1,
+        slow_obs_latency_steps=1, relative_action=True,
+        absolute_gripper_action=True,
+        relative_joint_anchor="slow_observation",
     )
     # Slow input is at 20 Hz tick 11, fast state at tick 12, command at tick 13.
     sample_index = next(
@@ -553,10 +581,20 @@ def test_slow_visual_and_proprio_precede_fast_state_and_command_by_two_ticks(
         root["data/right_robot_joint_pos"][11 * 3],
     )
     np.testing.assert_allclose(
-        sample["extended_obs"]["right_robot_joint_pos"][7],
-        root["data/right_robot_joint_pos"][12 * 3],
+        sample["extended_obs"]["right_robot_joint_effort_external"][7],
+        root["data/right_robot_joint_effort_external"][12 * 3],
     )
+    assert "right_robot_joint_pos" not in sample["extended_obs"]
     np.testing.assert_allclose(
-        sample["action"][7], root["data/right_robot_command"][13 * 3, :7]
+        sample["action"][7, :6],
+        root["data/right_robot_command"][13 * 3, :6]
+        - root["data/right_robot_joint_pos"][11 * 3, :6],
     )
+    np.testing.assert_allclose(sample["action"][7, 6], root["data/right_robot_command"][13 * 3, 6])
+    np.testing.assert_allclose(
+        sample["action"][8, :6],
+        root["data/right_robot_command"][14 * 3, :6]
+        - root["data/right_robot_joint_pos"][11 * 3, :6],
+    )
+    np.testing.assert_allclose(sample["action"][8, 6], root["data/right_robot_command"][14 * 3, 6])
     np.testing.assert_allclose(sample["obs"]["external_img"][-1, 0, 0, 0] * 255, 8 * 3)
